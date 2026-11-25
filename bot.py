@@ -758,6 +758,23 @@ async def on_invite_delete(invite):
 async def on_member_join(member):
     guild = member.guild
 
+    # if they're on the blacklist, kick them right back out
+    bl = db.execute(
+        "SELECT reason FROM blacklist WHERE guild_id=? AND user_id=?",
+        (guild.id, member.id),
+    ).fetchone()
+    if bl:
+        reason = bl[0] or "Blacklisted"
+        try:
+            await member.ban(reason=f"Blacklisted: {reason}")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Failed to re-ban blacklisted user %s on join", member.id)
+        await send_mod_log(
+            guild,
+            f"⛔ **Blacklisted user tried to join**\nMember: {member} (`{member.id}`)\nBanned again.\nReason: {reason}",
+        )
+        return
+
     # Invite tracking only: welcome messages have intentionally been removed.
     inviter_text = await get_inviter_text(guild)
     invite_channel_id = configured_guild_channel_id(
@@ -1975,6 +1992,7 @@ async def unmute(ctx, member: FlexibleMember):
 @bot.command()
 @require_ban()
 async def ban(ctx, target_input: str, *, reason="No reason provided"):
+    # normal server ban — kicks them out and keeps them out
     try:
         member = await resolve_member_arg(ctx, target_input)
         if not can_moderate_target(ctx, member):
@@ -1985,14 +2003,22 @@ async def ban(ctx, target_input: str, *, reason="No reason provided"):
     except commands.BadArgument:
         cleaned = re.sub(r"^[<@!]+|[>]+$", "", str(target_input).strip())
         if not cleaned.isdigit():
-            raise
-        target_id = int(cleaned)
-        try:
-            fetched = await bot.fetch_user(target_id)
-            target_label = f"{fetched} (`{target_id}`)"
-        except (discord.NotFound, discord.HTTPException):
-            target_label = f"User `{target_id}`"
-        await ctx.guild.ban(discord.Object(id=target_id), reason=f"{ctx.author}: {reason}")
+            # try resolving as a user (username / id) so it works offline too
+            try:
+                user = await resolve_user_arg(ctx, target_input)
+                target_id = user.id
+                target_label = str(user)
+                await ctx.guild.ban(discord.Object(id=target_id), reason=f"{ctx.author}: {reason}")
+            except commands.BadArgument:
+                return await ctx.send(f"Couldn’t find that user. Use a mention, ID, or exact username.")
+        else:
+            target_id = int(cleaned)
+            try:
+                fetched = await bot.fetch_user(target_id)
+                target_label = f"{fetched} (`{target_id}`)"
+            except (discord.NotFound, discord.HTTPException):
+                target_label = f"User `{target_id}`"
+            await ctx.guild.ban(discord.Object(id=target_id), reason=f"{ctx.author}: {reason}")
     sanction_id = record_sanction(ctx.guild.id, target_id, ctx.author.id, "Ban", reason)
     await ctx.send(f"🔨 **{target_label}** has been banned.\n**Reason:** {reason}\n**Case:** `#{sanction_id}`")
     await send_mod_log(ctx.guild, f"🔨 **Ban**\nUser: {target_label} (`{target_id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
@@ -2023,29 +2049,80 @@ async def kick(ctx, member: FlexibleMember, *, reason="No reason provided"):
 
 @bot.command(name="bl", aliases=["blacklist"])
 @require_owner_actions()
-async def blacklist_user(ctx, user: FlexibleUser, *, reason="No reason provided"):
+async def blacklist_user(ctx, user: FlexibleUser, *, reason="Blacklisted"):
+    # blacklist = permanent ban + mark in the db so they get re-banned if they sneak back
+    reason = (reason or "Blacklisted").strip()[:900] or "Blacklisted"
+    ban_reason = f"Blacklisted: {reason}"
+
+    # ban them from the server if they're in it (or by id if not)
+    member = ctx.guild.get_member(user.id)
+    try:
+        if member is not None:
+            if not can_moderate_target(ctx, member) and ctx.author.id != ctx.guild.owner_id:
+                return await ctx.send("You can’t blacklist that member because of role hierarchy.")
+            await member.ban(reason=f"{ctx.author}: {ban_reason}")
+        else:
+            await ctx.guild.ban(discord.Object(id=user.id), reason=f"{ctx.author}: {ban_reason}")
+    except discord.Forbidden:
+        return await ctx.send("I don’t have permission to ban that user. Check my role is above theirs and I have Ban Members.")
+    except discord.HTTPException:
+        logger.exception("Failed to ban user %s during blacklist", user.id)
+        return await ctx.send("Discord blocked the ban. They might already be banned, or something else went wrong.")
+
     db.execute(
         "INSERT OR REPLACE INTO blacklist(guild_id,user_id,moderator_id,reason) VALUES(?,?,?,?)",
         (ctx.guild.id, user.id, ctx.author.id, reason),
     )
     db.commit()
     sanction_id = record_sanction(ctx.guild.id, user.id, ctx.author.id, "Blacklist", reason)
-    await ctx.send(f"⛔ Added **{user}** to the bot blacklist. (Sanction #{sanction_id})")
-    await send_mod_log(ctx.guild, f"⛔ **Bot blacklist add**\nUser: {user} (`{user.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
+    await ctx.send(
+        f"⛔ **{user}** has been **blacklisted and banned** from the server.\n"
+        f"**Reason:** {reason}\n**Case:** `#{sanction_id}`"
+    )
+    await send_mod_log(
+        ctx.guild,
+        f"⛔ **Blacklist + Ban**\nUser: {user} (`{user.id}`)\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+    )
 
 
 @bot.command(name="unbl", aliases=["unblacklist"])
 @require_owner_actions()
-async def unblacklist_user(ctx, user_id: int):
+async def unblacklist_user(ctx, user_id: int, *, reason="Removed from blacklist"):
     cursor = db.execute(
         "DELETE FROM blacklist WHERE guild_id=? AND user_id=?",
         (ctx.guild.id, user_id),
     )
     db.commit()
     if cursor.rowcount == 0:
-        return await ctx.send("That user isn’t on the bot blacklist.")
-    await ctx.send(f"✅ Removed user `{user_id}` from the bot blacklist.")
-    await send_mod_log(ctx.guild, f"✅ **Bot blacklist removal**\nUser ID: `{user_id}`\nModerator: {ctx.author} (`{ctx.author.id}`)")
+        return await ctx.send("That user isn’t on the blacklist.")
+
+    # also unban so they can actually come back
+    try:
+        user = await bot.fetch_user(user_id)
+        await ctx.guild.unban(user, reason=f"{ctx.author}: {reason}")
+        label = str(user)
+    except discord.NotFound:
+        label = f"User `{user_id}`"
+    except (discord.Forbidden, discord.HTTPException):
+        label = f"User `{user_id}`"
+        await ctx.send(
+            f"✅ Removed `{user_id}` from the blacklist, but I couldn’t unban them "
+            f"(maybe they weren’t banned, or I’m missing permission)."
+        )
+        await send_mod_log(
+            ctx.guild,
+            f"✅ **Blacklist removal** (unban failed)\nUser ID: `{user_id}`\n"
+            f"Moderator: {ctx.author} (`{ctx.author.id}`)",
+        )
+        return
+
+    await ctx.send(f"✅ **{label}** removed from the blacklist and unbanned.")
+    await send_mod_log(
+        ctx.guild,
+        f"✅ **Blacklist removal + Unban**\nUser: {label} (`{user_id}`)\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+    )
 
 
 @bot.command(name="sanctions", aliases=["cases", "history"])
