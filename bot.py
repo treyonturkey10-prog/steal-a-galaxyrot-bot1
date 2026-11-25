@@ -295,7 +295,10 @@ bot = commands.Bot(
     cls=GalaxyContext,
     allowed_mentions=discord.AllowedMentions.none(),
 )
-DATABASE_PATH = os.getenv("DATABASE_PATH", "raiders.sqlite3")
+# Coins, strikes, etc. live in this sqlite file. Keep DATABASE_PATH pointed at a
+# persistent disk path on your host so redeploys don't wipe balances.
+_default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raiders.sqlite3")
+DATABASE_PATH = os.getenv("DATABASE_PATH", _default_db)
 database_dir = os.path.dirname(DATABASE_PATH)
 if database_dir:
     os.makedirs(database_dir, exist_ok=True)
@@ -376,6 +379,11 @@ db.execute("""CREATE TABLE IF NOT EXISTS galaxy_coins (
     balance INTEGER NOT NULL DEFAULT 0,
     last_daily TEXT,
     PRIMARY KEY (guild_id, user_id)
+)""")
+# remembers when the last riddle was posted so restarts don't spam a new one
+db.execute("""CREATE TABLE IF NOT EXISTS galaxy_meta (
+    guild_id INTEGER PRIMARY KEY,
+    last_riddle_at REAL
 )""")
 db.commit()
 
@@ -1445,62 +1453,99 @@ async def snipe(ctx):
 
 
 
-async def galaxy_game_scheduler():
-    # Posts a fresh riddle every 1h30m. People have to reply to the riddle
-    # message itself if they want to guess (so random chat doesn't count).
-    await bot.wait_until_ready()
+def _get_last_riddle_at(guild_id):
+    row = db.execute(
+        "SELECT last_riddle_at FROM galaxy_meta WHERE guild_id=?",
+        (guild_id,),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def _set_last_riddle_at(guild_id, when=None):
+    when = time.time() if when is None else float(when)
+    db.execute(
+        "INSERT INTO galaxy_meta(guild_id, last_riddle_at) VALUES(?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET last_riddle_at=excluded.last_riddle_at",
+        (guild_id, when),
+    )
+    db.commit()
+
+
+async def _post_galaxy_riddle(guild, channel):
     RIDDLE_PING_ROLE_ID = 1549925951373058241
+    previous = active_galaxy_questions.pop(guild.id, None)
+    if previous is not None:
+        try:
+            await send_panel(
+                channel,
+                f"⌛ Round over. The answer was **{previous['answer']}**.",
+                title="GALAXY  /  RIDDLE",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not post the previous riddle answer.")
+
+    question = random.choice(GALAXY_QUESTIONS)
+    active_galaxy_questions[guild.id] = {
+        **question,
+        "hints_used": 0,
+        "wrong_guesses": 0,
+        "message_id": None,
+    }
+    try:
+        riddle_embed = build_galaxy_embed(
+            f"**{question['question']}**\n\n"
+            f"guys guess the riddle for galaxy coins\n"
+            f"Reply to this message with your answer. Wrong guesses get a hint "
+            f"(up to 3). First correct answer wins a random "
+            f"**{GALAXY_QUESTION_REWARD_MIN}–{GALAXY_QUESTION_REWARD_MAX} Galaxy Coins**!",
+            title="GALAXY  /  RIDDLE",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  COMMUNITY GAME",
+        )
+        riddle_msg = await channel.send(
+            content=f"<@&{RIDDLE_PING_ROLE_ID}>",
+            embed=riddle_embed,
+            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=RIDDLE_PING_ROLE_ID)]),
+        )
+        active_galaxy_questions[guild.id]["message_id"] = riddle_msg.id
+        _set_last_riddle_at(guild.id)
+    except (discord.Forbidden, discord.HTTPException):
+        active_galaxy_questions.pop(guild.id, None)
+        logger.exception("Could not post a new Galaxy riddle.")
+
+
+async def galaxy_game_scheduler():
+    # Posts a riddle every 1h30m. Last post time is saved in the DB so a code
+    # restart does NOT fire a new riddle early — it waits out the rest of the timer.
+    await bot.wait_until_ready()
     while not bot.is_closed():
+        now = time.time()
+        # figure out how long until the next riddle is due (across guilds we just
+        # use the soonest due time, then post whichever are ready)
+        sleep_for = GALAXY_GAME_INTERVAL_SECONDS
         for guild in bot.guilds:
-            channel = await fetch_guild_text_channel(guild, GALAXY_GAME_CHANNEL_ID)
-            if channel is None or not isinstance(channel, discord.TextChannel):
-                logger.warning(
-                    "Riddle channel %s is unavailable in guild %s (%s)",
-                    GALAXY_GAME_CHANNEL_ID, guild.name, guild.id
-                )
-                continue
-
-            previous = active_galaxy_questions.pop(guild.id, None)
-            if previous is not None:
-                try:
-                    await send_panel(
-                        channel,
-                        f"⌛ Round over. The answer was **{previous['answer']}**.",
-                        title="GALAXY  /  RIDDLE",
+            last = _get_last_riddle_at(guild.id)
+            if last is None:
+                # first ever run for this guild — wait the full interval before posting
+                remaining = GALAXY_GAME_INTERVAL_SECONDS
+            else:
+                remaining = GALAXY_GAME_INTERVAL_SECONDS - (now - last)
+            if remaining <= 0:
+                channel = await fetch_guild_text_channel(guild, GALAXY_GAME_CHANNEL_ID)
+                if channel is None or not isinstance(channel, discord.TextChannel):
+                    logger.warning(
+                        "Riddle channel %s is unavailable in guild %s (%s)",
+                        GALAXY_GAME_CHANNEL_ID, guild.name, guild.id
                     )
-                except (discord.Forbidden, discord.HTTPException):
-                    logger.exception("Could not post the previous riddle answer.")
+                    # don't tight-loop if the channel is missing — pretend we posted
+                    _set_last_riddle_at(guild.id)
+                    remaining = GALAXY_GAME_INTERVAL_SECONDS
+                else:
+                    await _post_galaxy_riddle(guild, channel)
+                    remaining = GALAXY_GAME_INTERVAL_SECONDS
+            sleep_for = min(sleep_for, max(5, remaining))
 
-            question = random.choice(GALAXY_QUESTIONS)
-            active_galaxy_questions[guild.id] = {
-                **question,
-                "hints_used": 0,
-                "wrong_guesses": 0,
-                "message_id": None,  # filled in after we post it
-            }
-            try:
-                # Ping the role so people notice; panel holds the riddle. Reply to this msg to guess.
-                riddle_embed = build_galaxy_embed(
-                    f"**{question['question']}**\n\n"
-                    f"guys guess the riddle for galaxy coins\n"
-                    f"Reply to this message with your answer. Wrong guesses get a hint "
-                    f"(up to 3). First correct answer wins a random "
-                    f"**{GALAXY_QUESTION_REWARD_MIN}–{GALAXY_QUESTION_REWARD_MAX} Galaxy Coins**!",
-                    title="GALAXY  /  RIDDLE",
-                    color=GALAXY_ACCENT,
-                    footer="GALAXY  ·  COMMUNITY GAME",
-                )
-                riddle_msg = await channel.send(
-                    content=f"<@&{RIDDLE_PING_ROLE_ID}>",
-                    embed=riddle_embed,
-                    allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=RIDDLE_PING_ROLE_ID)]),
-                )
-                active_galaxy_questions[guild.id]["message_id"] = riddle_msg.id
-            except (discord.Forbidden, discord.HTTPException):
-                active_galaxy_questions.pop(guild.id, None)
-                logger.exception("Could not post a new Galaxy riddle.")
-
-        await asyncio.sleep(GALAXY_GAME_INTERVAL_SECONDS)
+        await asyncio.sleep(sleep_for)
 
 
 def build_coin_leaderboard(guild):
@@ -1509,20 +1554,26 @@ def build_coin_leaderboard(guild):
         "WHERE guild_id=? AND balance > 0 ORDER BY balance DESC, user_id ASC LIMIT 10",
         (guild.id,),
     ).fetchall()
-    embed = discord.Embed(title="Galaxy Coins  /  Leaderboard",
-                          color=discord.Color.from_rgb(111, 66, 193))
+    embed = discord.Embed(
+        title="GALAXY  /  COIN LEADERBOARD",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
     if not rows:
-        embed.description = "No one has earned Galaxy Coins yet. Be the first!"
+        embed.description = "No one has Galaxy Coins yet. Hit daily, win a riddle, or get trading."
     else:
         medals = ["🥇", "🥈", "🥉"]
         lines = []
         for index, (user_id, balance) in enumerate(rows, start=1):
             member = guild.get_member(user_id)
             name = member.display_name if member else f"User {user_id}"
-            rank = medals[index - 1] if index <= 3 else f"`#{index}`"
-            lines.append(f"{rank} **{discord.utils.escape_markdown(name)}** — **{balance:,}** coins")
+            rank = medals[index - 1] if index <= 3 else f"**#{index}**"
+            lines.append(
+                f"{rank}  **{discord.utils.escape_markdown(name)}**\n"
+                f"┗ **{int(balance):,}** Galaxy Coins"
+            )
         embed.description = "\n".join(lines)
-    embed.set_footer(text="GALAXY  •  TOP 10  •  REFRESHES EVERY 3 HOURS")
+    embed.set_footer(text="GALAXY  ·  TOP 10 RICHEST  ·  UPDATES EVERY 3 HOURS")
     return embed
 
 
