@@ -324,6 +324,8 @@ active_galaxy_questions = {}  # guild_id -> active question dictionary
 # Most recently deleted messages, kept separately for each text channel.
 sniped_messages = {}
 cleared_message_ids = set()
+# Active temp roles: (guild_id, user_id, role_id) -> asyncio.Task
+temp_role_tasks = {}
 
 def record_sanction(guild_id, user_id, moderator_id, sanction_type, reason,
                     details="", source_warning_id=None):
@@ -2593,6 +2595,104 @@ async def delrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
     await update_member_role(ctx, member, role_name, adding=False)
 
 
+@bot.command(name="temprole", aliases=["temproles", "temproleadd"])
+@commands.guild_only()
+@require_perm1()
+async def temprole(ctx, member: FlexibleMember = None, duration: str = None, *, role_name: str = None):
+    """Give a role for a limited time.
+    Examples:
+      +temprole @user 1h Cool Role
+      reply to someone +temprole 30m Cool Role
+      +temprole @user 2d Event Access
+    """
+    # reply can supply the member (handled by FlexibleMember / reply injector)
+    if member is None or duration is None or not role_name:
+        return await ctx.send(
+            f"Usage: `{PREFIX}temprole @user <time> <role name>`\n"
+            f"Or reply to their message: `{PREFIX}temprole <time> <role name>`\n"
+            f"Time examples: `10m`, `1h`, `6h`, `1d`, `7d`"
+        )
+
+    try:
+        seconds = parse_duration_seconds(duration)
+    except ValueError:
+        return await ctx.send(
+            f"Invalid time. Examples: `10m`, `30m`, `1h`, `6h`, `1d`.\n"
+            f"Full usage: `{PREFIX}temprole @user 1h Role Name`"
+        )
+    if seconds < 60:
+        return await ctx.send("Temp role has to last at least **1 minute**.")
+    if seconds > 30 * 86400:
+        return await ctx.send("Temp role can’t be longer than **30 days**.")
+
+    role = await find_role_by_name(ctx, role_name)
+    if role is None:
+        return await ctx.send(f"I couldn’t find a role named **{discord.utils.escape_markdown(role_name)}**.")
+    if role.is_default() or role.managed:
+        return await ctx.send("I can’t manage the @everyone role or a role managed by an integration.")
+    if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.send("That role is equal to or higher than your highest role.")
+    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
+        return await ctx.send("That role is equal to or higher than my highest role. Move my bot role above it.")
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
+
+    already_had = role in member.roles
+    if not already_had:
+        try:
+            await member.add_roles(role, reason=f"Temp role by {ctx.author} ({ctx.author.id}) for {format_duration_label(seconds)}")
+        except discord.Forbidden:
+            return await ctx.send("I don’t have permission to add that role. Check Manage Roles + role order.")
+        except discord.HTTPException:
+            logger.exception("Temp role add failed for %s / %s", member.id, role.id)
+            return await ctx.send("Discord couldn’t add that role. Try again.")
+
+    key = (ctx.guild.id, member.id, role.id)
+    old_task = temp_role_tasks.pop(key, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    async def _remove_later():
+        try:
+            await asyncio.sleep(seconds)
+            # re-fetch in case they left / rejoined
+            target = ctx.guild.get_member(member.id)
+            if target is None:
+                return
+            current_role = ctx.guild.get_role(role.id)
+            if current_role is None or current_role not in target.roles:
+                return
+            await target.remove_roles(current_role, reason="Temp role expired")
+            await send_mod_log(
+                ctx.guild,
+                f"⌛ **Temp role expired**\nRole: {current_role.name} (`{current_role.id}`)\n"
+                f"Member: {target} (`{target.id}`)",
+            )
+        except asyncio.CancelledError:
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Failed to remove temp role %s from %s", role.id, member.id)
+        finally:
+            temp_role_tasks.pop(key, None)
+
+    temp_role_tasks[key] = asyncio.create_task(_remove_later())
+    label = format_duration_label(seconds)
+    if already_had:
+        await ctx.send(
+            f"⏱️ {member.mention} already had {role.mention}. Timer reset — it will be removed in **{label}**."
+        )
+    else:
+        await ctx.send(
+            f"⏱️ Gave {member.mention} {role.mention} for **{label}**. It’ll be removed automatically."
+        )
+    await send_mod_log(
+        ctx.guild,
+        f"⏱️ **Temp role added**\nRole: {role.name} (`{role.id}`)\n"
+        f"Member: {member} (`{member.id}`)\nDuration: {label}\n"
+        f"By: {ctx.author} (`{ctx.author.id}`)",
+    )
+
+
 @bot.command(name="unwarn")
 @require_perm1()
 async def unwarn(ctx, warning_id: int):
@@ -2717,7 +2817,8 @@ async def help(ctx):
         name="SERVER & STAFF TOOLS",
         value=(
             f"`{PREFIX}lock`  `{PREFIX}unlock`  `{PREFIX}slowmode`\n"
-            f"`{PREFIX}nick`  `{PREFIX}addrole`  `{PREFIX}delrole`  `{PREFIX}antiraid on/off/status`\n"
+            f"`{PREFIX}nick`  `{PREFIX}addrole`  `{PREFIX}delrole`  `{PREFIX}temprole @user 1h Role`\n"
+            f"`{PREFIX}antiraid on/off/status`\n"
             f"`{PREFIX}bl` / `{PREFIX}blacklist`  `{PREFIX}unbl` / `{PREFIX}unblacklist`"
         ),
         inline=False,
