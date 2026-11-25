@@ -326,6 +326,8 @@ sniped_messages = {}
 cleared_message_ids = set()
 # Active temp roles: (guild_id, user_id, role_id) -> asyncio.Task
 temp_role_tasks = {}
+# Active VC mute/deafen timers: (guild_id, user_id, "mute"|"deafen") -> asyncio.Task
+temp_vc_tasks = {}
 
 def record_sanction(guild_id, user_id, moderator_id, sanction_type, reason,
                     details="", source_warning_id=None):
@@ -2083,6 +2085,207 @@ async def unmute(ctx, member: FlexibleMember):
     await send_mod_log(ctx.guild, f"🔊 **Timeout removed**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)")
 
 
+async def _schedule_vc_lift(guild, user_id, kind, seconds, moderator):
+    """After `seconds`, clear server mute or deafen on the member."""
+    key = (guild.id, user_id, kind)
+    old = temp_vc_tasks.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+
+    async def _lift():
+        try:
+            await asyncio.sleep(seconds)
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    return
+            kwargs = {"mute": False} if kind == "mute" else {"deafen": False}
+            await member.edit(**kwargs, reason="Temporary VC restriction expired")
+            label = "unmute" if kind == "mute" else "undeafen"
+            await send_mod_log(
+                guild,
+                f"🔊 **VC {label} (timer)**\nUser: {member} (`{member.id}`)\n"
+                f"Original mod: {moderator}",
+            )
+        except asyncio.CancelledError:
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Failed to auto-%s user %s", kind, user_id)
+        finally:
+            temp_vc_tasks.pop(key, None)
+
+    temp_vc_tasks[key] = asyncio.create_task(_lift())
+
+
+@bot.command(name="vcmute", aliases=["voicemute", "servermute"])
+@commands.guild_only()
+@require_staff_rank(4)
+async def vcmute(ctx, member: FlexibleMember = None, duration: str = None, *, reason="No reason provided"):
+    """Server-mute someone in VC. Optional time: +vcmute @user 10m"""
+    if member is None:
+        return await ctx.send(
+            f"Usage: `{PREFIX}vcmute @user [time] [reason]`\n"
+            f"Or reply to them: `{PREFIX}vcmute [time] [reason]`\n"
+            f"Time is optional (e.g. `10m`, `1h`). No time = stays muted until unmuted."
+        )
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t VC mute that member because of role hierarchy.")
+
+    seconds = None
+    if duration is not None:
+        # duration might actually be start of reason if they didn't pass a time
+        try:
+            seconds = parse_duration_seconds(duration)
+            if seconds < 60 or seconds > 28 * 86400:
+                return await ctx.send("VC mute timer must be between **1 minute and 28 days**.")
+        except ValueError:
+            # treat as reason text, not a duration
+            if reason == "No reason provided":
+                reason = duration
+            else:
+                reason = f"{duration} {reason}"
+            seconds = None
+
+    try:
+        await member.edit(mute=True, reason=f"{ctx.author}: {reason}")
+    except discord.Forbidden:
+        return await ctx.send("I can’t server-mute them. I need **Mute Members** and a higher role.")
+    except discord.HTTPException:
+        logger.exception("vcmute failed for %s", member.id)
+        return await ctx.send("Discord couldn’t apply the VC mute. Are they in the server?")
+
+    if seconds:
+        await _schedule_vc_lift(ctx.guild, member.id, "mute", seconds, str(ctx.author))
+        label = format_duration_label(seconds)
+        await ctx.send(f"🔇 {member.mention} server-muted for **{label}**.")
+        await send_mod_log(
+            ctx.guild,
+            f"🔇 **VC mute**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
+            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+        )
+    else:
+        # cancel any pending auto-unmute
+        key = (ctx.guild.id, member.id, "mute")
+        old = temp_vc_tasks.pop(key, None)
+        if old and not old.done():
+            old.cancel()
+        await ctx.send(f"🔇 {member.mention} server-muted.")
+        await send_mod_log(
+            ctx.guild,
+            f"🔇 **VC mute**\nUser: {member} (`{member.id}`)\nDuration: permanent\n"
+            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+        )
+
+
+@bot.command(name="vcunmute", aliases=["voiceunmute", "serverunmute"])
+@commands.guild_only()
+@require_staff_rank(4)
+async def vcunmute(ctx, member: FlexibleMember = None):
+    if member is None:
+        return await ctx.send(f"Usage: `{PREFIX}vcunmute @user` (or reply to them).")
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t VC unmute that member because of role hierarchy.")
+    key = (ctx.guild.id, member.id, "mute")
+    old = temp_vc_tasks.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+    try:
+        await member.edit(mute=False, reason=f"VC unmute by {ctx.author}")
+    except discord.Forbidden:
+        return await ctx.send("I can’t unmute them. I need **Mute Members** and a higher role.")
+    except discord.HTTPException:
+        return await ctx.send("Discord couldn’t unmute them.")
+    await ctx.send(f"🔊 {member.mention} is no longer server-muted.")
+    await send_mod_log(
+        ctx.guild,
+        f"🔊 **VC unmute**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)",
+    )
+
+
+@bot.command(name="vcdeafen", aliases=["vcdeaf", "voicedeafen", "serverdeafen"])
+@commands.guild_only()
+@require_staff_rank(4)
+async def vcdeafen(ctx, member: FlexibleMember = None, duration: str = None, *, reason="No reason provided"):
+    """Server-deafen someone in VC. Optional time: +vcdeafen @user 10m"""
+    if member is None:
+        return await ctx.send(
+            f"Usage: `{PREFIX}vcdeafen @user [time] [reason]`\n"
+            f"Or reply to them: `{PREFIX}vcdeafen [time] [reason]`\n"
+            f"Time is optional (e.g. `10m`, `1h`). No time = stays deafened until undeafened."
+        )
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t VC deafen that member because of role hierarchy.")
+
+    seconds = None
+    if duration is not None:
+        try:
+            seconds = parse_duration_seconds(duration)
+            if seconds < 60 or seconds > 28 * 86400:
+                return await ctx.send("VC deafen timer must be between **1 minute and 28 days**.")
+        except ValueError:
+            if reason == "No reason provided":
+                reason = duration
+            else:
+                reason = f"{duration} {reason}"
+            seconds = None
+
+    try:
+        await member.edit(deafen=True, reason=f"{ctx.author}: {reason}")
+    except discord.Forbidden:
+        return await ctx.send("I can’t server-deafen them. I need **Deafen Members** and a higher role.")
+    except discord.HTTPException:
+        logger.exception("vcdeafen failed for %s", member.id)
+        return await ctx.send("Discord couldn’t apply the VC deafen. Are they in the server?")
+
+    if seconds:
+        await _schedule_vc_lift(ctx.guild, member.id, "deafen", seconds, str(ctx.author))
+        label = format_duration_label(seconds)
+        await ctx.send(f"🔇 {member.mention} server-deafened for **{label}**.")
+        await send_mod_log(
+            ctx.guild,
+            f"🔇 **VC deafen**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
+            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+        )
+    else:
+        key = (ctx.guild.id, member.id, "deafen")
+        old = temp_vc_tasks.pop(key, None)
+        if old and not old.done():
+            old.cancel()
+        await ctx.send(f"🔇 {member.mention} server-deafened.")
+        await send_mod_log(
+            ctx.guild,
+            f"🔇 **VC deafen**\nUser: {member} (`{member.id}`)\nDuration: permanent\n"
+            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+        )
+
+
+@bot.command(name="vcundeafen", aliases=["vcundeaf", "voiceundeafen", "serverundeafen"])
+@commands.guild_only()
+@require_staff_rank(4)
+async def vcundeafen(ctx, member: FlexibleMember = None):
+    if member is None:
+        return await ctx.send(f"Usage: `{PREFIX}vcundeafen @user` (or reply to them).")
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t VC undeafen that member because of role hierarchy.")
+    key = (ctx.guild.id, member.id, "deafen")
+    old = temp_vc_tasks.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+    try:
+        await member.edit(deafen=False, reason=f"VC undeafen by {ctx.author}")
+    except discord.Forbidden:
+        return await ctx.send("I can’t undeafen them. I need **Deafen Members** and a higher role.")
+    except discord.HTTPException:
+        return await ctx.send("Discord couldn’t undeafen them.")
+    await ctx.send(f"🔊 {member.mention} is no longer server-deafened.")
+    await send_mod_log(
+        ctx.guild,
+        f"🔊 **VC undeafen**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)",
+    )
+
+
 @bot.command()
 @require_ban()
 async def ban(ctx, target_input: str, *, reason="No reason provided"):
@@ -2809,6 +3012,7 @@ async def help(ctx):
             f"`{PREFIX}warn`  `{PREFIX}warnings`  `{PREFIX}clearwarns`  `{PREFIX}unwarn` (Perm 1+)\n"
             f"`{PREFIX}sanctions @user` (Perm 1+)  `{PREFIX}del sanction <id>` (Perm 2+)\n"
             f"`{PREFIX}tempmute` / `{PREFIX}timeout <member> <10m/1h/7d>`  `{PREFIX}unmute`\n"
+            f"`{PREFIX}vcmute` / `{PREFIX}vcdeafen` [time] (Perm 4+)  `{PREFIX}vcunmute`  `{PREFIX}vcundeafen`\n"
             f"`{PREFIX}clear <amount>` / reply `{PREFIX}clear <amount>`  `{PREFIX}kick` (Perm 3+)\n"
             f"`{PREFIX}ban` (Perm 4+)  `{PREFIX}unban`"
         ),
@@ -2990,4 +3194,3 @@ if not TOKEN:
     raise SystemExit("Galaxy Bot cannot start: DISCORD_TOKEN is missing. Add DISCORD_TOKEN=your_bot_token to the host environment or .env file, then restart.")
 
 bot.run(TOKEN)
-
