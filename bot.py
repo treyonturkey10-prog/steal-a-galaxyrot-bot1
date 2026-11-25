@@ -1470,23 +1470,58 @@ async def galaxy_daily(ctx):
 
 @bot.command(name="coinflip", aliases=["cf", "gamble"])
 @commands.cooldown(1, 3, commands.BucketType.user)
-async def galaxy_gamble(ctx, amount: str):
+async def galaxy_gamble(ctx, amount: str, side: str = None):
+    # amount can be a number, 2k, 1m, or "all"
+    # optional side: heads / h / tails / t
+    # your side only lands about 40% of the time (house edge)
     try:
         amount = parse_coin_amount(amount, current_balance=get_coin_balance(ctx.guild.id, ctx.author.id))
     except ValueError:
-        return await ctx.send("Enter a valid bet amount (for example: `100`, `2k`, `1m`, or `all`).")
+        return await ctx.send(f"Enter a valid bet (example: `{PREFIX}cf 100`, `{PREFIX}cf 2k heads`, `{PREFIX}cf all tails`).")
     if amount < 1:
         return await ctx.send("You’ll need to bet at least **1 Galaxy Coin**.")
     if amount > MAX_SQLITE_INT:
         return await ctx.send("That bet amount is too large.")
+
+    choice = None
+    if side is not None:
+        cleaned = side.strip().lower()
+        if cleaned in ("heads", "head", "h"):
+            choice = "heads"
+        elif cleaned in ("tails", "tail", "t"):
+            choice = "tails"
+        else:
+            return await ctx.send(f"Side has to be **heads** or **tails** (or just leave it blank). Example: `{PREFIX}cf 250 tails`")
+
     success, balance = spend_coins(ctx.guild.id, ctx.author.id, amount)
     if not success:
         return await ctx.send(f"You only have **{balance:,} Galaxy Coins**.")
-    if random.random() < 0.5:
-        change_coins(ctx.guild.id, ctx.author.id, amount * 2)
-        await ctx.send(f"🪙 **Heads — You won!** Net profit: **+{amount:,} Galaxy Coins**. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**.")
+
+    # 40% chance your picked side wins. if they didn't pick, just 50/50
+    if choice is None:
+        landed = "heads" if random.random() < 0.5 else "tails"
+        won = landed == "heads"  # keep old flavour when no side given
     else:
-        await ctx.send(f"🪙 **Tails — You lost!** You lost **{amount:,} Galaxy Coins**. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**.")
+        # player-favoured side only hits ~40% of the time
+        player_wins = random.random() < 0.40
+        if player_wins:
+            landed = choice
+            won = True
+        else:
+            landed = "tails" if choice == "heads" else "heads"
+            won = False
+
+    if won:
+        change_coins(ctx.guild.id, ctx.author.id, amount * 2)
+        await ctx.send(
+            f"🪙 **{landed.title()} — You won!** Net profit: **+{amount:,}** "
+            f"Galaxy Coins. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**."
+        )
+    else:
+        await ctx.send(
+            f"🪙 **{landed.title()} — You lost!** You lost **{amount:,}** "
+            f"Galaxy Coins. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**."
+        )
 
 @bot.command(name="slots")
 @commands.cooldown(1, 3, commands.BucketType.user)
@@ -1772,21 +1807,40 @@ async def staff_strikes(ctx, member: FlexibleMember):
 
 @bot.command(name="removestrike", aliases=["unstrike", "delstrike"])
 @commands.guild_only()
-@require_staff_strike_access()
-async def remove_staff_strike(ctx, identifier: int = None, *, reason="No reason provided"):
-    """Remove a staff strike using either its Strike ID or the Strike Message ID (or by replying to the strike message)."""
+@require_staff_strike_access()  # Assistant Staff Manager+ (perm 5) and up
+async def remove_staff_strike(ctx, identifier: str = None, *, reason="No reason provided"):
+    """Remove a staff strike.
+    Works with:
+      +removestrike <strike_id>
+      +removestrike <message_id>
+      reply to the strike message with +removestrike
+    """
     db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
     db.commit()
+
+    # reply to the strike message = use that message id
     if identifier is None and ctx.message.reference and ctx.message.reference.message_id:
-        identifier = ctx.message.reference.message_id
+        identifier = str(ctx.message.reference.message_id)
+
     if identifier is None:
-        return await ctx.send(f"Usage: `{PREFIX}removestrike <strike_id or message_id> [reason]` (or reply to the strike message).")
+        return await ctx.send(
+            f"Usage: `{PREFIX}removestrike <strike_id or message_id> [reason]`\n"
+            f"Or just reply to the strike message with `{PREFIX}removestrike`."
+        )
+
+    # allow pasting a raw snowflake or a full discord message link
+    id_match = re.search(r"(\d{15,22})", str(identifier))
+    if not id_match:
+        return await ctx.send("That doesn’t look like a strike ID or message ID.")
+    identifier = int(id_match.group(1))
+
     row = db.execute(
         "SELECT id, user_id, reason, moderator_id, created_at FROM staff_strikes "
         "WHERE guild_id=? AND (id=? OR response_message_id=? OR audit_message_id=?)",
         (ctx.guild.id, identifier, identifier, identifier),
     ).fetchone()
-    # Fallback: if a Discord message ID from the channel or strike-log channel was passed, parse Strike ID from the embed
+
+    # fallback: pull the strike id out of the embed if they gave a message id we don't have stored
     if row is None and identifier > 1000000000000000:
         found_msg = None
         for ch in (ctx.channel, await fetch_guild_text_channel(ctx.guild, STRIKE_LOG_CHANNEL_ID)):
@@ -1811,7 +1865,7 @@ async def remove_staff_strike(ctx, identifier: int = None, *, reason="No reason 
                     (ctx.guild.id, parsed_id),
                 ).fetchone()
     if row is None:
-        return await ctx.send("I couldn’t find that strike by Strike ID or Message ID. Check the ID and try again.")
+        return await ctx.send("Couldn’t find that strike. Double-check the ID or reply to the original strike message.")
     strike_id, target_user_id, orig_reason, orig_mod_id, orig_created_at = row
     row = (target_user_id, orig_reason, orig_mod_id, orig_created_at)
     db.execute("DELETE FROM staff_strikes WHERE guild_id=? AND id=?", (ctx.guild.id, strike_id))
@@ -2480,8 +2534,9 @@ async def help(ctx):
     embed.add_field(
         name="STAFF STRIKES",
         value=(
-            f"`{PREFIX}strike`  `{PREFIX}strikes`  `{PREFIX}removestrike <strike_id or message_id>`\n"
-            "Available to Perm 5+ roles. Strikes expire after 30 days."
+            f"`{PREFIX}strike`  `{PREFIX}strikes`  `{PREFIX}removestrike <id or message_id>`\n"
+            f"Or reply to the strike message with `{PREFIX}removestrike`. "
+            "Assistant Staff Manager+ only. Strikes expire after 30 days."
         ),
         inline=False,
     )
@@ -2489,12 +2544,11 @@ async def help(ctx):
         name="GALAXY COINS",
         value=(
             f"`{PREFIX}balance` / `{PREFIX}bal`  `{PREFIX}daily`  `{PREFIX}tradecoins` / `{PREFIX}givecoins`\n"
-            f"`{PREFIX}coinflip` / `{PREFIX}cf` / `{PREFIX}gamble`  `{PREFIX}slots`  `{PREFIX}leaderboard`\n"
+            f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}cf all tails`  `{PREFIX}slots`  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
-            "Anyone can trade their own coins with another member. Assistant Staff Manager and higher can "
-            "add, remove, or set other members’ balances. Riddles post every 30 min in the game channel — "
-            "you have to reply to the riddle message to guess. Wrong answers give up to 3 hints, first "
-            "correct one gets a random coin reward. Leaderboard posts every 3 hours."
+            "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
+            "(your side lands ~40% of the time). Riddles post every 30 min — reply to the riddle message "
+            "to guess. Wrong answers give up to 3 hints. Leaderboard every 3 hours."
         ),
         inline=False,
     )
