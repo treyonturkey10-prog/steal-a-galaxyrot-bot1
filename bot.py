@@ -41,6 +41,16 @@ DEFAULT_INVITES_CHANNEL_ID = int(os.getenv("INVITES_CHANNEL_ID", "15499610774738
 DEFAULT_MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "1574938206107869296"))
 # Staff-strike logs use the permanent channel unless test mode is enabled.
 STRIKE_LOG_CHANNEL_ID = 1549959193614753852
+# Roles applied based on active staff-strike count (expire with the strikes after 15 days).
+STAFF_STRIKE_ONE_ROLE_ID = 1549926282022879244
+STAFF_STRIKE_TWO_ROLE_ID = 1549926314998370344
+STAFF_STRIKE_THREE_ROLE_ID = 1549926355305758850
+STAFF_STRIKE_LEVEL_ROLE_IDS = (
+    STAFF_STRIKE_ONE_ROLE_ID,
+    STAFF_STRIKE_TWO_ROLE_ID,
+    STAFF_STRIKE_THREE_ROLE_ID,
+)
+STAFF_STRIKE_EXPIRE_DAYS = 15
 GIVEAWAY_BOT_ID = 530082442967646230
 GIVEAWAY_PING_ROLE_ID = 1549926161054695514
 MAX_SQLITE_INT = (1 << 63) - 1
@@ -706,8 +716,10 @@ async def get_inviter_text(guild):
 
 @bot.event
 async def on_ready():
-    # Staff strikes expire automatically 30 days after they were issued.
-    db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
+    # Staff strikes expire automatically 15 days after they were issued.
+    db.execute(
+        f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
+    )
     db.commit()
     logger.info("Logged in as %s (ID %s) | Prefix: %s | Guilds: %s",
                 bot.user, getattr(bot.user, "id", "unknown"), PREFIX, len(bot.guilds))
@@ -718,6 +730,24 @@ async def on_ready():
                 getattr(discord, "__version__", "unknown"), DATABASE_PATH, PREFIX)
     for guild in bot.guilds:
         await refresh_invites(guild)
+        # keep strike roles honest after expiry cleanup
+        try:
+            user_ids = set()
+            for row in db.execute(
+                "SELECT DISTINCT user_id FROM staff_strikes WHERE guild_id=?",
+                (guild.id,),
+            ).fetchall():
+                user_ids.add(int(row[0]))
+            for role_id in STAFF_STRIKE_LEVEL_ROLE_IDS:
+                role = guild.get_role(role_id)
+                if role is None:
+                    continue
+                for m in role.members:
+                    user_ids.add(m.id)
+            for uid in user_ids:
+                await sync_staff_strike_roles(guild, uid)
+        except Exception:
+            logger.exception("Strike role sync on ready failed for guild %s", guild.id)
         log_channel_id = configured_guild_channel_id(
             guild, MOD_LOG_CHANNEL_IDS, DEFAULT_MOD_LOG_CHANNEL_ID
         )
@@ -1606,6 +1636,58 @@ def can_moderate_target(ctx, member):
     return member.top_role < ctx.author.top_role
 
 
+async def sync_staff_strike_roles(guild, member_or_id):
+    """Give/remove the strike-1/2/3 roles so they match how many active strikes they have."""
+    if guild is None:
+        return
+    user_id = member_or_id.id if hasattr(member_or_id, "id") else int(member_or_id)
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    # purge expired first so the count is honest
+    db.execute(
+        f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
+    )
+    db.commit()
+    count = db.execute(
+        "SELECT COUNT(*) FROM staff_strikes WHERE guild_id=? AND user_id=?",
+        (guild.id, user_id),
+    ).fetchone()[0]
+    count = int(count or 0)
+
+    wanted = set()
+    if count >= 1:
+        wanted.add(STAFF_STRIKE_ONE_ROLE_ID)
+    if count >= 2:
+        wanted.add(STAFF_STRIKE_TWO_ROLE_ID)
+    if count >= 3:
+        wanted.add(STAFF_STRIKE_THREE_ROLE_ID)
+
+    current = {r.id for r in member.roles}
+    to_add = []
+    to_remove = []
+    for role_id in STAFF_STRIKE_LEVEL_ROLE_IDS:
+        role = guild.get_role(role_id)
+        if role is None:
+            continue
+        if role_id in wanted and role_id not in current:
+            to_add.append(role)
+        elif role_id not in wanted and role_id in current:
+            to_remove.append(role)
+
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Staff strike role sync")
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Staff strike role sync")
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Could not sync strike roles for member %s in guild %s", user_id, guild.id)
+
+
 @bot.command()
 @require_perm1()
 async def perms(ctx):
@@ -1714,7 +1796,9 @@ async def clearwarns(ctx, member: FlexibleMember):
 @require_staff_strike_access()
 async def staff_strike(ctx, member: FlexibleMember, *, reason="No reason provided"):
     """Issue a staff strike and send a compact branded audit panel."""
-    db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
+    db.execute(
+        f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
+    )
     db.commit()
     if not has_any_role(member, set(ROLE_IDS.values())):
         return await ctx.send("That member isn’t on the staff team, so a staff strike doesn’t apply to them.")
@@ -1732,6 +1816,8 @@ async def staff_strike(ctx, member: FlexibleMember, *, reason="No reason provide
         "SELECT COUNT(*) FROM staff_strikes WHERE guild_id=? AND user_id=?",
         (ctx.guild.id, member.id),
     ).fetchone()[0]
+    # apply strike-1 / strike-2 / strike-3 roles to match the new count
+    await sync_staff_strike_roles(ctx.guild, member)
     issued_at = discord.utils.utcnow()
 
     response = discord.Embed(
@@ -1782,7 +1868,9 @@ async def staff_strike(ctx, member: FlexibleMember, *, reason="No reason provide
 @commands.guild_only()
 @require_staff_strike_access()
 async def staff_strikes(ctx, member: FlexibleMember):
-    db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
+    db.execute(
+        f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
+    )
     db.commit()
     if not has_any_role(member, set(ROLE_IDS.values())):
         return await ctx.send("I can’t find a staff role on that member. This command only works for configured staff.")
@@ -1803,7 +1891,7 @@ async def staff_strikes(ctx, member: FlexibleMember):
     )
     history.set_author(name="STEAL A GALACTICROT  ·  STAFF MANAGEMENT")
     history.add_field(name="Active strikes", value=f"`{active_count}`", inline=True)
-    history.add_field(name="Retention", value="`30 days`", inline=True)
+    history.add_field(name="Retention", value=f"`{STAFF_STRIKE_EXPIRE_DAYS} days`", inline=True)
     if rows:
         lines = []
         for strike_id, reason, created_at, moderator_id in rows:
@@ -1832,7 +1920,9 @@ async def remove_staff_strike(ctx, identifier: str = None, *, reason="No reason 
       +removestrike <message_id>
       reply to the strike message with +removestrike
     """
-    db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
+    db.execute(
+        f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
+    )
     db.commit()
 
     ref_msg = None
@@ -1914,6 +2004,8 @@ async def remove_staff_strike(ctx, identifier: str = None, *, reason="No reason 
     row = (target_user_id, orig_reason, orig_mod_id, orig_created_at)
     db.execute("DELETE FROM staff_strikes WHERE guild_id=? AND id=?", (ctx.guild.id, strike_id))
     db.commit()
+    # drop/adjust strike roles to match what's left
+    await sync_staff_strike_roles(ctx.guild, target_user_id)
     removed_at = discord.utils.utcnow()
     reason = (reason or "No reason provided").strip()[:900] or "No reason provided"
     remaining_count = db.execute(
@@ -2635,7 +2727,8 @@ async def help(ctx):
         value=(
             f"`{PREFIX}strike`  `{PREFIX}strikes`  `{PREFIX}removestrike <id or message_id>`\n"
             f"Or reply to the strike message with `{PREFIX}removestrike`. "
-            "Assistant Staff Manager+ only. Strikes expire after 30 days."
+            "Assistant Staff Manager+ only. 1st/2nd/3rd strike roles are applied automatically. "
+            f"Strikes (and those roles) expire after {STAFF_STRIKE_EXPIRE_DAYS} days."
         ),
         inline=False,
     )
