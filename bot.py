@@ -200,27 +200,88 @@ intents.message_content = True
 
 # Galaxy visual identity: midnight plum with a quiet lavender accent.
 GALAXY_COLOR = discord.Color.from_rgb(48, 39, 65)
+GALAXY_ACCENT = discord.Color.from_rgb(111, 66, 193)
 # Staff records keep the Galaxy base theme, with restrained status colors.
 STRIKE_ISSUED_COLOR = discord.Color.from_rgb(224, 145, 65)
 STRIKE_REMOVED_COLOR = discord.Color.from_rgb(76, 166, 112)
+SUCCESS_COLOR = discord.Color.from_rgb(76, 166, 112)
+WARN_COLOR = discord.Color.from_rgb(224, 145, 65)
+ERROR_COLOR = discord.Color.from_rgb(190, 80, 90)
+
+
+def _guess_panel_style(text):
+    """Pick a soft title + color from the message so panels feel consistent."""
+    t = (text or "").strip()
+    low = t.casefold()
+    if any(k in low for k in ("banned", "blacklist", "kicked", "deleted", "removed", "cleared")):
+        return "GALAXY  /  MODERATION", WARN_COLOR
+    if any(k in low for k in ("muted", "deafened", "timeout", "slowmode", "locked")):
+        return "GALAXY  /  MODERATION", WARN_COLOR
+    if any(k in low for k in ("unmuted", "undeafen", "unlocked", "unbanned", "✅", "gave ", "added")):
+        return "GALAXY  /  DONE", SUCCESS_COLOR
+    if any(k in low for k in ("can’t", "can't", "couldn’t", "couldn't", "invalid", "failed", "don’t", "don't", "need")):
+        return "GALAXY  /  NOTICE", ERROR_COLOR
+    if any(k in low for k in ("won", "reward", "coins", "daily", "balance")):
+        return "GALAXY  /  COINS", GALAXY_ACCENT
+    if t.startswith("Usage:") or "example" in low:
+        return "GALAXY  /  HELP", GALAXY_COLOR
+    return "GALAXY", GALAXY_COLOR
+
+
+def build_galaxy_embed(content=None, *, title=None, color=None, footer="GALAXY  ·  COMMUNITY"):
+    """Build a neat standard panel. Used by ctx.send and log helpers."""
+    text = None if content is None else str(content).strip()
+    if title is None or color is None:
+        guessed_title, guessed_color = _guess_panel_style(text or "")
+        title = title or guessed_title
+        color = color or guessed_color
+    embed = discord.Embed(title=title, color=color, timestamp=discord.utils.utcnow())
+    if text:
+        embed.description = text
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+async def send_panel(destination, content=None, *, title=None, color=None, embed=None, **kwargs):
+    """Send a Galaxy panel to any channel/messageable (not only ctx)."""
+    if destination is None:
+        return None
+    if embed is None:
+        embed = build_galaxy_embed(content, title=title, color=color)
+    else:
+        if embed.color is None or embed.color.value == 0:
+            embed.color = GALAXY_COLOR
+        if not embed.footer or not embed.footer.text:
+            embed.set_footer(text="GALAXY  ·  COMMUNITY")
+        if embed.timestamp is None:
+            embed.timestamp = discord.utils.utcnow()
+    kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
+    return await destination.send(embed=embed, **kwargs)
 
 
 class GalaxyContext(commands.Context):
-    """Consistent, understated response styling for the Galaxy community."""
+    """Every reply goes out as a clean Galaxy panel."""
     async def send(self, content=None, **kwargs):
         embed = kwargs.get("embed")
         if embed is None and content is not None:
-            embed = discord.Embed(description=str(content), color=GALAXY_COLOR)
+            embed = build_galaxy_embed(content)
             kwargs.pop("content", None)
             kwargs["embed"] = embed
             content = None
         if embed is not None:
-            if embed.color is None:
+            if embed.color is None or embed.color.value == 0:
                 embed.color = GALAXY_COLOR
             if not embed.footer or not embed.footer.text:
-                embed.set_footer(text="Galaxy Community")
+                embed.set_footer(text="GALAXY  ·  COMMUNITY")
             if embed.timestamp is None:
                 embed.timestamp = discord.utils.utcnow()
+            # plain embeds with only a description still get a title so they look like panels
+            if not embed.title and embed.description:
+                guessed_title, guessed_color = _guess_panel_style(embed.description)
+                embed.title = guessed_title
+                if embed.color == GALAXY_COLOR:
+                    embed.color = guessed_color
         kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
         kwargs.pop("reference", None)
         kwargs.pop("mention_author", None)
@@ -381,6 +442,45 @@ def format_duration_label(total_seconds):
         mins = total_seconds // 60
         return f"{mins} minute" if mins == 1 else f"{mins} minutes"
     return f"{total_seconds} seconds"
+
+
+def parse_vc_duration_arg(duration, reason="No reason provided"):
+    """Parse optional VC timer from command args.
+
+    Handles split forms like duration='10' reason='secs spam' -> 10 seconds.
+    Returns (seconds_or_None, cleaned_reason).
+    """
+    if duration is None:
+        return None, reason
+
+    reason = reason or "No reason provided"
+    candidates = [duration]
+    reason_tokens = reason.split() if reason and reason != "No reason provided" else []
+    # if they wrote "10 secs" the unit lands in reason — glue it back
+    if reason_tokens:
+        candidates.insert(0, f"{duration} {reason_tokens[0]}")
+
+    seconds = None
+    used_unit_from_reason = False
+    for i, cand in enumerate(candidates):
+        try:
+            seconds = parse_duration_seconds(cand)
+            used_unit_from_reason = i == 0 and reason_tokens and cand != duration
+            break
+        except ValueError:
+            continue
+
+    if seconds is None:
+        # not a duration at all — treat duration text as part of the reason
+        if reason == "No reason provided":
+            return None, duration
+        return None, f"{duration} {reason}"
+
+    if used_unit_from_reason:
+        rest = " ".join(reason_tokens[1:]).strip()
+        reason = rest if rest else "No reason provided"
+
+    return seconds, reason
 
 
 def parse_coin_amount(raw_value, current_balance=None):
@@ -639,9 +739,22 @@ async def send_mod_log(guild, text):
         return False
     try:
         if isinstance(text, discord.Embed):
-            await channel.send(embed=text, allowed_mentions=discord.AllowedMentions.none())
+            emb = text
+            if emb.color is None or emb.color.value == 0:
+                emb.color = GALAXY_COLOR
+            if not emb.footer or not emb.footer.text:
+                emb.set_footer(text="GALAXY  ·  STAFF LOG")
+            if emb.timestamp is None:
+                emb.timestamp = discord.utils.utcnow()
+            await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         else:
-            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+            emb = build_galaxy_embed(
+                text,
+                title="GALAXY  /  STAFF LOG",
+                color=GALAXY_COLOR,
+                footer="GALAXY  ·  STAFF LOG",
+            )
+            await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         return True
     except discord.Forbidden:
         logger.error("Missing permission to send logs in #%s (%s), guild %s",
@@ -662,8 +775,21 @@ async def send_strike_log(guild, text):
         return None
     try:
         if isinstance(text, discord.Embed):
-            return await channel.send(embed=text, allowed_mentions=discord.AllowedMentions.none())
-        return await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+            emb = text
+            if emb.color is None or emb.color.value == 0:
+                emb.color = GALAXY_COLOR
+            if not emb.footer or not emb.footer.text:
+                emb.set_footer(text="GALAXY  ·  STAFF AUDIT")
+            if emb.timestamp is None:
+                emb.timestamp = discord.utils.utcnow()
+            return await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        emb = build_galaxy_embed(
+            text,
+            title="GALAXY  /  STAFF AUDIT",
+            color=GALAXY_COLOR,
+            footer="GALAXY  ·  STAFF AUDIT",
+        )
+        return await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
     except discord.Forbidden:
         logger.error("Missing permission to send strike logs in channel %s", channel_id)
     except discord.HTTPException as exc:
@@ -817,7 +943,11 @@ async def on_member_join(member):
     channel = await fetch_guild_text_channel(guild, invite_channel_id)
     if channel:
         try:
-            await channel.send(f"📨 **Member joined:** {member.mention} (`{member.id}`). {inviter_text}")
+            await send_panel(
+                channel,
+                f"📨 **Member joined:** {member.mention} (`{member.id}`). {inviter_text}",
+                title="GALAXY  /  JOINS",
+            )
         except (discord.Forbidden, discord.HTTPException):
             pass
     await send_mod_log(guild, f"📥 **Member joined**\nMember: {member} (`{member.id}`)\nAccount created: {discord.utils.format_dt(member.created_at, style='R')}\n{inviter_text}")
@@ -832,7 +962,7 @@ async def on_member_join(member):
         alert = f"⚠️ **Possible join raid:** {len(joins)} members joined within {JOIN_WINDOW_SECONDS} seconds. Staff should review recent joins."
         if channel:
             try:
-                await channel.send(alert)
+                await send_panel(channel, alert, title="GALAXY  /  ANTIRAID", color=WARN_COLOR)
             except (discord.Forbidden, discord.HTTPException):
                 pass
         await send_mod_log(guild, alert)
@@ -1190,8 +1320,10 @@ async def on_message(message):
         if hints_used < min(3, len(hints)):
             hint_number = hints_used + 1
             active["hints_used"] = hint_number
-            await message.channel.send(
-                f"❌ Nope. **Hint {hint_number}/3:** {hints[hint_number - 1]}"
+            await send_panel(
+                message.channel,
+                f"❌ Nope. **Hint {hint_number}/3:** {hints[hint_number - 1]}",
+                title="GALAXY  /  RIDDLE",
             )
         else:
             await message.add_reaction("❌")
@@ -1331,8 +1463,10 @@ async def galaxy_game_scheduler():
             previous = active_galaxy_questions.pop(guild.id, None)
             if previous is not None:
                 try:
-                    await channel.send(
-                        f"⌛ Round over. The answer was **{previous['answer']}**."
+                    await send_panel(
+                        channel,
+                        f"⌛ Round over. The answer was **{previous['answer']}**.",
+                        title="GALAXY  /  RIDDLE",
                     )
                 except (discord.Forbidden, discord.HTTPException):
                     logger.exception("Could not post the previous riddle answer.")
@@ -1345,15 +1479,20 @@ async def galaxy_game_scheduler():
                 "message_id": None,  # filled in after we post it
             }
             try:
-                # Ping the role so people actually notice, then the riddle.
-                # They have to reply to *this* message to guess.
-                riddle_msg = await channel.send(
-                    f"<@&{RIDDLE_PING_ROLE_ID}> guys guess the riddle for galaxy coins\n\n"
-                    f"🌌 **GALAXY RIDDLE!**\n"
-                    f"{question['question']}\n\n"
+                # Ping the role so people notice; panel holds the riddle. Reply to this msg to guess.
+                riddle_embed = build_galaxy_embed(
+                    f"**{question['question']}**\n\n"
+                    f"guys guess the riddle for galaxy coins\n"
                     f"Reply to this message with your answer. Wrong guesses get a hint "
                     f"(up to 3). First correct answer wins a random "
                     f"**{GALAXY_QUESTION_REWARD_MIN}–{GALAXY_QUESTION_REWARD_MAX} Galaxy Coins**!",
+                    title="GALAXY  /  RIDDLE",
+                    color=GALAXY_ACCENT,
+                    footer="GALAXY  ·  COMMUNITY GAME",
+                )
+                riddle_msg = await channel.send(
+                    content=f"<@&{RIDDLE_PING_ROLE_ID}>",
+                    embed=riddle_embed,
                     allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=RIDDLE_PING_ROLE_ID)]),
                 )
                 active_galaxy_questions[guild.id]["message_id"] = riddle_msg.id
@@ -2123,30 +2262,19 @@ async def _schedule_vc_lift(guild, user_id, kind, seconds, moderator):
 @commands.guild_only()
 @require_staff_rank(4)
 async def vcmute(ctx, member: FlexibleMember = None, duration: str = None, *, reason="No reason provided"):
-    """Server-mute someone in VC. Optional time: +vcmute @user 10m"""
+    """Server-mute someone in VC. Optional time: +vcmute @user 10m / 30s / 10 secs"""
     if member is None:
         return await ctx.send(
             f"Usage: `{PREFIX}vcmute @user [time] [reason]`\n"
             f"Or reply to them: `{PREFIX}vcmute [time] [reason]`\n"
-            f"Time is optional (e.g. `10m`, `1h`). No time = stays muted until unmuted."
+            f"Time is optional (e.g. `30s`, `10 secs`, `10m`, `1h`). No time = stays muted until unmuted."
         )
     if not can_moderate_target(ctx, member):
         return await ctx.send("You can’t VC mute that member because of role hierarchy.")
 
-    seconds = None
-    if duration is not None:
-        # duration might actually be start of reason if they didn't pass a time
-        try:
-            seconds = parse_duration_seconds(duration)
-            if seconds < 60 or seconds > 28 * 86400:
-                return await ctx.send("VC mute timer must be between **1 minute and 28 days**.")
-        except ValueError:
-            # treat as reason text, not a duration
-            if reason == "No reason provided":
-                reason = duration
-            else:
-                reason = f"{duration} {reason}"
-            seconds = None
+    seconds, reason = parse_vc_duration_arg(duration, reason)
+    if seconds is not None and (seconds < 1 or seconds > 28 * 86400):
+        return await ctx.send("VC mute timer must be between **1 second and 28 days**.")
 
     try:
         await member.edit(mute=True, reason=f"{ctx.author}: {reason}")
@@ -2208,28 +2336,19 @@ async def vcunmute(ctx, member: FlexibleMember = None):
 @commands.guild_only()
 @require_staff_rank(4)
 async def vcdeafen(ctx, member: FlexibleMember = None, duration: str = None, *, reason="No reason provided"):
-    """Server-deafen someone in VC. Optional time: +vcdeafen @user 10m"""
+    """Server-deafen someone in VC. Optional time: +vcdeafen @user 10m / 30s / 10 secs"""
     if member is None:
         return await ctx.send(
             f"Usage: `{PREFIX}vcdeafen @user [time] [reason]`\n"
             f"Or reply to them: `{PREFIX}vcdeafen [time] [reason]`\n"
-            f"Time is optional (e.g. `10m`, `1h`). No time = stays deafened until undeafened."
+            f"Time is optional (e.g. `30s`, `10 secs`, `10m`, `1h`). No time = stays deafened until undeafened."
         )
     if not can_moderate_target(ctx, member):
         return await ctx.send("You can’t VC deafen that member because of role hierarchy.")
 
-    seconds = None
-    if duration is not None:
-        try:
-            seconds = parse_duration_seconds(duration)
-            if seconds < 60 or seconds > 28 * 86400:
-                return await ctx.send("VC deafen timer must be between **1 minute and 28 days**.")
-        except ValueError:
-            if reason == "No reason provided":
-                reason = duration
-            else:
-                reason = f"{duration} {reason}"
-            seconds = None
+    seconds, reason = parse_vc_duration_arg(duration, reason)
+    if seconds is not None and (seconds < 1 or seconds > 28 * 86400):
+        return await ctx.send("VC deafen timer must be between **1 second and 28 days**.")
 
     try:
         await member.edit(deafen=True, reason=f"{ctx.author}: {reason}")
@@ -2742,15 +2861,59 @@ async def nick(ctx, member: FlexibleMember, *, nickname: str = None):
 
 
 async def find_role_by_name(ctx, role_name):
-    """Find a role by exact name (case-insensitive), including names with spaces."""
-    wanted = role_name.strip().casefold()
-    return next((role for role in ctx.guild.roles if role.name.casefold() == wanted), None)
+    """Find a role by mention, id, full name, or a short partial name."""
+    text = (role_name or "").strip()
+    if not text:
+        return None
+    # role ping: <@&123...>
+    mention = re.fullmatch(r"<@&(\d{15,22})>", text)
+    if mention:
+        role = ctx.guild.get_role(int(mention.group(1)))
+        if role is not None:
+            return role
+    # raw snowflake
+    if text.isdigit() and len(text) >= 15:
+        role = ctx.guild.get_role(int(text))
+        if role is not None:
+            return role
+    # mention buried in the string
+    buried = re.search(r"<@&(\d{15,22})>", text)
+    if buried:
+        role = ctx.guild.get_role(int(buried.group(1)))
+        if role is not None:
+            return role
+
+    wanted = text.casefold()
+    roles = [r for r in ctx.guild.roles if not r.is_default()]
+
+    # 1) exact name
+    exact = [r for r in roles if r.name.casefold() == wanted]
+    if exact:
+        return exact[0]
+
+    # 2) starts with what they typed (e.g. "partner" -> "Partnership Manager")
+    starts = [r for r in roles if r.name.casefold().startswith(wanted)]
+    if len(starts) == 1:
+        return starts[0]
+    if len(starts) > 1:
+        starts.sort(key=lambda r: len(r.name))
+        return starts[0]
+
+    # 3) name contains what they typed
+    contains = [r for r in roles if wanted in r.name.casefold()]
+    if len(contains) == 1:
+        return contains[0]
+    if len(contains) > 1:
+        contains.sort(key=lambda r: len(r.name))
+        return contains[0]
+
+    return None
 
 
 async def update_member_role(ctx, member, role_name, adding):
     role = await find_role_by_name(ctx, role_name)
     if role is None:
-        return await ctx.send(f"I couldn’t find a role named **{discord.utils.escape_markdown(role_name)}**.")
+        return await ctx.send(f"I couldn’t find that role. Ping it, use the name, or paste the role id.")
     if role.is_default() or role.managed:
         return await ctx.send("I can’t manage the @everyone role or a role managed by an integration.")
     if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
@@ -2783,9 +2946,12 @@ async def update_member_role(ctx, member, role_name, adding):
 @commands.guild_only()
 @require_perm1()
 async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
-    """Add a role to a member; replying to their message can supply the member."""
+    """Add a role to a member; reply works, and you can ping the role."""
     if member is None or not role_name:
-        return await ctx.send(f"Usage: reply to a member and type `{PREFIX}addrole Role Name`, or `{PREFIX}addrole @member Role Name`.")
+        return await ctx.send(
+            f"Usage: `{PREFIX}addrole @member Role Name` or `{PREFIX}addrole @member @Role`\n"
+            f"Or reply to them: `{PREFIX}addrole Role Name` / `{PREFIX}addrole @Role`"
+        )
     await update_member_role(ctx, member, role_name, adding=True)
 
 
@@ -2793,9 +2959,12 @@ async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
 @commands.guild_only()
 @require_perm1()
 async def delrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
-    """Remove a role from a member; replying to their message can supply the member."""
+    """Remove a role from a member; reply works, and you can ping the role."""
     if member is None or not role_name:
-        return await ctx.send(f"Usage: reply to a member and type `{PREFIX}delrole Role Name`, or `{PREFIX}delrole @member Role Name`.")
+        return await ctx.send(
+            f"Usage: `{PREFIX}delrole @member Role Name` or `{PREFIX}delrole @member @Role`\n"
+            f"Or reply to them: `{PREFIX}delrole Role Name` / `{PREFIX}delrole @Role`"
+        )
     await update_member_role(ctx, member, role_name, adding=False)
 
 
