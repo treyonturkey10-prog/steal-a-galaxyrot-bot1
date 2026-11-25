@@ -2554,7 +2554,8 @@ async def update_member_role(ctx, member, role_name, adding):
         return await ctx.send("I can’t manage that role because it is equal to or higher than your highest role.")
     if ctx.guild.me is None or role >= ctx.guild.me.top_role:
         return await ctx.send("I can’t manage that role because it is equal to or higher than my highest role. Move my bot role above it.")
-    if not can_moderate_target(ctx, member):
+    # allow using addrole/delrole on yourself; still block equal/higher staff on others
+    if member.id != ctx.author.id and not can_moderate_target(ctx, member):
         return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
     if adding and role in member.roles:
         return await ctx.send(f"{member.mention} already has {role.mention}.")
@@ -2634,7 +2635,7 @@ async def temprole(ctx, member: FlexibleMember = None, duration: str = None, *, 
         return await ctx.send("That role is equal to or higher than your highest role.")
     if ctx.guild.me is None or role >= ctx.guild.me.top_role:
         return await ctx.send("That role is equal to or higher than my highest role. Move my bot role above it.")
-    if not can_moderate_target(ctx, member):
+    if member.id != ctx.author.id and not can_moderate_target(ctx, member):
         return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
 
     already_had = role in member.roles
@@ -2989,3 +2990,4 @@ if not TOKEN:
     raise SystemExit("Galaxy Bot cannot start: DISCORD_TOKEN is missing. Add DISCORD_TOKEN=your_bot_token to the host environment or .env file, then restart.")
 
 bot.run(TOKEN)
+
