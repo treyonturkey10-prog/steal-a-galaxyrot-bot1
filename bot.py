@@ -2944,7 +2944,7 @@ async def update_member_role(ctx, member, role_name, adding):
 
 @bot.command(name="addrole")
 @commands.guild_only()
-@require_perm1()
+@require_staff_rank(5)
 async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
     """Add a role to a member; reply works, and you can ping the role."""
     if member is None or not role_name:
@@ -2957,7 +2957,7 @@ async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
 
 @bot.command(name="delrole")
 @commands.guild_only()
-@require_perm1()
+@require_staff_rank(5)
 async def delrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
     """Remove a role from a member; reply works, and you can ping the role."""
     if member is None or not role_name:
@@ -2970,7 +2970,7 @@ async def delrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
 
 @bot.command(name="temprole", aliases=["temproles", "temproleadd"])
 @commands.guild_only()
-@require_perm1()
+@require_staff_rank(5)
 async def temprole(ctx, member: FlexibleMember = None, duration: str = None, *, role_name: str = None):
     """Give a role for a limited time.
     Examples:
@@ -3191,7 +3191,7 @@ async def help(ctx):
         name="SERVER & STAFF TOOLS",
         value=(
             f"`{PREFIX}lock`  `{PREFIX}unlock`  `{PREFIX}slowmode`\n"
-            f"`{PREFIX}nick`  `{PREFIX}addrole`  `{PREFIX}delrole`  `{PREFIX}temprole @user 1h Role`\n"
+            f"`{PREFIX}nick`  `{PREFIX}addrole` / `{PREFIX}delrole` / `{PREFIX}temprole` (Perm 5+)\n"
             f"`{PREFIX}antiraid on/off/status`\n"
             f"`{PREFIX}bl` / `{PREFIX}blacklist`  `{PREFIX}unbl` / `{PREFIX}unblacklist`"
         ),
