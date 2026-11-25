@@ -47,7 +47,7 @@ MAX_SQLITE_INT = (1 << 63) - 1
 JOIN_WINDOW_SECONDS = int(os.getenv("JOIN_WINDOW_SECONDS", "20"))
 JOIN_BURST_LIMIT = int(os.getenv("JOIN_BURST_LIMIT", "6"))
 GALAXY_GAME_CHANNEL_ID = 1574936058121027604
-GALAXY_GAME_INTERVAL_SECONDS = 30 * 60  # New riddle every 30 minutes.
+GALAXY_GAME_INTERVAL_SECONDS = 90 * 60  # New riddle every 1 hour 30 minutes.
 GALAXY_QUESTION_REWARD_MIN = 50
 GALAXY_QUESTION_REWARD_MAX = 250
 GALAXY_LEADERBOARD_CHANNEL_ID = 1549950104516165682
@@ -1263,7 +1263,7 @@ async def snipe(ctx):
 
 
 async def galaxy_game_scheduler():
-    # Posts a fresh riddle every 30 min. People have to reply to the riddle
+    # Posts a fresh riddle every 1h30m. People have to reply to the riddle
     # message itself if they want to guess (so random chat doesn't count).
     await bot.wait_until_ready()
     RIDDLE_PING_ROLE_ID = 1549925951373058241
@@ -1818,9 +1818,19 @@ async def remove_staff_strike(ctx, identifier: str = None, *, reason="No reason 
     db.execute("DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-30 days')")
     db.commit()
 
-    # reply to the strike message = use that message id
-    if identifier is None and ctx.message.reference and ctx.message.reference.message_id:
-        identifier = str(ctx.message.reference.message_id)
+    ref_msg = None
+    # if they replied to a message, grab that message id + the message itself
+    if ctx.message.reference and ctx.message.reference.message_id:
+        ref_id = ctx.message.reference.message_id
+        if identifier is None:
+            identifier = str(ref_id)
+        # try to resolve the actual message so we can read the embed
+        try:
+            ref_msg = ctx.message.reference.resolved
+            if ref_msg is None:
+                ref_msg = await ctx.channel.fetch_message(ref_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            ref_msg = None
 
     if identifier is None:
         return await ctx.send(
@@ -1840,32 +1850,49 @@ async def remove_staff_strike(ctx, identifier: str = None, *, reason="No reason 
         (ctx.guild.id, identifier, identifier, identifier),
     ).fetchone()
 
-    # fallback: pull the strike id out of the embed if they gave a message id we don't have stored
-    if row is None and identifier > 1000000000000000:
-        found_msg = None
-        for ch in (ctx.channel, await fetch_guild_text_channel(ctx.guild, STRIKE_LOG_CHANNEL_ID)):
-            if ch is None:
+    # if we still don't have a row, try reading the strike id out of the message embed
+    if row is None:
+        candidates = []
+        if ref_msg is not None:
+            candidates.append(ref_msg)
+        # also try fetching by the id they gave us (current channel + strike log channel)
+        if identifier > 1000000000000000:
+            for ch in (ctx.channel, await fetch_guild_text_channel(ctx.guild, STRIKE_LOG_CHANNEL_ID)):
+                if ch is None:
+                    continue
+                try:
+                    fetched = await ch.fetch_message(identifier)
+                    if fetched and fetched not in candidates:
+                        candidates.append(fetched)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+
+        for msg in candidates:
+            if not msg.embeds:
                 continue
-            try:
-                found_msg = await ch.fetch_message(identifier)
-                if found_msg:
-                    break
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                continue
-        if found_msg and found_msg.embeds:
+            emb = msg.embeds[0]
             embed_blob = " ".join(
-                [found_msg.embeds[0].title or "", found_msg.embeds[0].description or ""]
-                + [f"{f.name} {f.value}" for f in found_msg.embeds[0].fields]
+                [emb.title or "", emb.description or ""]
+                + [f"{f.name} {f.value}" for f in emb.fields]
             )
-            m = re.search(r"#(\d+)", embed_blob)
+            # look for "#2" style strike ids (prefer the one next to "Strike ID" / "Strike record")
+            m = re.search(r"(?:Strike ID|Strike record|Strike)\s*[`:]?\s*#?(\d+)", embed_blob, re.I)
+            if not m:
+                m = re.search(r"#(\d+)", embed_blob)
             if m:
                 parsed_id = int(m.group(1))
                 row = db.execute(
                     "SELECT id, user_id, reason, moderator_id, created_at FROM staff_strikes WHERE guild_id=? AND id=?",
                     (ctx.guild.id, parsed_id),
                 ).fetchone()
+                if row:
+                    break
+
     if row is None:
-        return await ctx.send("Couldn’t find that strike. Double-check the ID or reply to the original strike message.")
+        return await ctx.send(
+            "Couldn’t find that strike. Reply to the original strike message "
+            f"(or the audit one), or use `{PREFIX}removestrike <strike_id>`."
+        )
     strike_id, target_user_id, orig_reason, orig_mod_id, orig_created_at = row
     row = (target_user_id, orig_reason, orig_mod_id, orig_created_at)
     db.execute("DELETE FROM staff_strikes WHERE guild_id=? AND id=?", (ctx.guild.id, strike_id))
@@ -2242,6 +2269,8 @@ async def clear_messages(ctx, target_or_amount: str = None, amount: int = None):
                     if len(to_delete) >= delete_count:
                         break
 
+        # include the command message itself so it disappears with the rest
+        to_delete.append(ctx.message)
         for m in to_delete:
             cleared_message_ids.add(m.id)
 
@@ -2264,16 +2293,9 @@ async def clear_messages(ctx, target_or_amount: str = None, amount: int = None):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
-        # just wipe the command message too after a second so it doesn't sit there
-        async def _delete_command_quietly(cmd_msg):
-            await asyncio.sleep(1)
-            try:
-                cleared_message_ids.add(cmd_msg.id)
-                await cmd_msg.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-
-        asyncio.create_task(_delete_command_quietly(ctx.message))
+        # don't count the command message itself in the "deleted" number we log
+        if ctx.message in to_delete or ctx.message.id in {m.id for m in to_delete}:
+            actual_deleted = max(0, actual_deleted - 1)
 
         # only log it, no public "X messages deleted" spam in the channel
         log_lines = [
@@ -2547,7 +2569,7 @@ async def help(ctx):
             f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}cf all tails`  `{PREFIX}slots`  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
             "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
-            "(your side lands ~40% of the time). Riddles post every 30 min — reply to the riddle message "
+            "(your side lands ~40% of the time). Riddles post every 1h 30m — reply to the riddle message "
             "to guess. Wrong answers give up to 3 hints. Leaderboard every 3 hours."
         ),
         inline=False,
