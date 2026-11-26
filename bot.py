@@ -335,9 +335,10 @@ bot = commands.Bot(
     cls=GalaxyContext,
     allowed_mentions=discord.AllowedMentions.none(),
 )
-# Coins live in sqlite. The bot NEVER deletes galaxy_coins rows on startup.
-# On hosts like Railway, the app folder is wiped every deploy — mount a volume
-# and set DATABASE_PATH to a file on that volume, or balances will look "reset".
+# Coins live in sqlite at /data/raiders.sqlite3 (hardcoded for Railway volumes).
+# Mount a volume at /data so this file survives deploys. The bot never wipes balances.
+import shutil
+
 def _sqlite_coin_total(path):
     """Return total coins stored in a db file, or -1 if the file can't be read."""
     if not path or not os.path.isfile(path):
@@ -361,23 +362,28 @@ def _sqlite_coin_total(path):
 
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-_env_db = (os.getenv("DATABASE_PATH") or "").strip()
-_candidates = []
-for path in (
-    _env_db,
+# Always use /data — create it if the volume/host allows.
+DATABASE_PATH = (os.getenv("DATABASE_PATH") or "").strip() or "/data/raiders.sqlite3"
+try:
+    os.makedirs(os.path.dirname(DATABASE_PATH) or "/data", exist_ok=True)
+except Exception:
+    # /data not writable (no volume yet) — fall back next to the bot so it still runs
+    DATABASE_PATH = os.path.join(_script_dir, "raiders.sqlite3")
+    try:
+        os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    except Exception:
+        pass
+
+# If the chosen DB is empty, pull coins from any older copy we can still see
+_candidates = [
+    DATABASE_PATH,
     "/data/raiders.sqlite3",
     "/app/data/raiders.sqlite3",
     os.path.join(_script_dir, "raiders.sqlite3"),
     os.path.join(_script_dir, "data", "raiders.sqlite3"),
     "raiders.sqlite3",
-):
-    if path and path not in _candidates:
-        _candidates.append(path)
-
-# Prefer whichever existing file already holds the most coins (stops "lost" balances
-# when a deploy switches folders). Fall back to env path, then /data, then local.
-_best_path = None
-_best_total = -1
+]
+_best_path, _best_total = None, -1
 for path in _candidates:
     total = _sqlite_coin_total(path)
     logger.info("DB candidate %s → coin total %s", path, total)
@@ -385,41 +391,30 @@ for path in _candidates:
         _best_total = total
         _best_path = path
 
-if _env_db:
-    # honor explicit env, but if it's empty and another candidate has coins, copy them in
-    DATABASE_PATH = _env_db
-    if _sqlite_coin_total(DATABASE_PATH) <= 0 and _best_path and _best_total > 0 and os.path.abspath(_best_path) != os.path.abspath(DATABASE_PATH):
-        try:
-            database_dir = os.path.dirname(DATABASE_PATH)
-            if database_dir:
-                os.makedirs(database_dir, exist_ok=True)
-            import shutil
-            shutil.copy2(_best_path, DATABASE_PATH)
-            # also copy WAL/SHM if present so we don't lose recent writes
-            for suffix in ("-wal", "-shm"):
-                side = _best_path + suffix
-                if os.path.isfile(side):
-                    shutil.copy2(side, DATABASE_PATH + suffix)
-            logger.warning(
-                "Restored coin database from %s → %s (%s total coins)",
-                _best_path, DATABASE_PATH, _best_total,
-            )
-        except Exception:
-            logger.exception("Failed to restore coin database from %s", _best_path)
-            DATABASE_PATH = _best_path
-elif _best_path and _best_total > 0:
-    DATABASE_PATH = _best_path
-elif os.path.isdir("/data"):
-    DATABASE_PATH = "/data/raiders.sqlite3"
-else:
-    DATABASE_PATH = os.path.join(_script_dir, "raiders.sqlite3")
+if (
+    _best_path
+    and _best_total > 0
+    and os.path.abspath(_best_path) != os.path.abspath(DATABASE_PATH)
+    and _sqlite_coin_total(DATABASE_PATH) <= 0
+):
+    try:
+        os.makedirs(os.path.dirname(DATABASE_PATH) or ".", exist_ok=True)
+        shutil.copy2(_best_path, DATABASE_PATH)
+        for suffix in ("-wal", "-shm"):
+            side = _best_path + suffix
+            if os.path.isfile(side):
+                shutil.copy2(side, DATABASE_PATH + suffix)
+        logger.warning(
+            "Restored coin database from %s → %s (%s total coins)",
+            _best_path, DATABASE_PATH, _best_total,
+        )
+    except Exception:
+        logger.exception("Failed to restore coin database from %s", _best_path)
+        DATABASE_PATH = _best_path
 
-database_dir = os.path.dirname(DATABASE_PATH)
-if database_dir:
-    os.makedirs(database_dir, exist_ok=True)
 db = sqlite3.connect(DATABASE_PATH, timeout=30)
 db.execute("PRAGMA journal_mode=WAL")
-db.execute("PRAGMA synchronous=FULL")  # safer against sudden process kills
+db.execute("PRAGMA synchronous=FULL")
 db.execute("PRAGMA foreign_keys=ON")
 db.execute("PRAGMA busy_timeout=30000")
 logger.info("Coin/strike database in use: %s", os.path.abspath(DATABASE_PATH))
@@ -507,6 +502,104 @@ try:
 except sqlite3.OperationalError:
     pass  # column already exists on older DBs
 db.commit()
+
+# JSON safety-net for balances. Survives some host mishaps when kept on a volume.
+COIN_BACKUP_PATHS = []
+for _bp in (
+    os.path.join(os.path.dirname(os.path.abspath(DATABASE_PATH)), "galaxy_coins_backup.json"),
+    "/data/galaxy_coins_backup.json",
+    "/app/data/galaxy_coins_backup.json",
+    os.path.join(_script_dir, "galaxy_coins_backup.json"),
+):
+    if _bp and _bp not in COIN_BACKUP_PATHS:
+        COIN_BACKUP_PATHS.append(_bp)
+
+
+def save_coin_backup():
+    """Write all balances to every reachable backup path."""
+    try:
+        rows = db.execute(
+            "SELECT guild_id, user_id, balance, last_daily FROM galaxy_coins WHERE balance > 0"
+        ).fetchall()
+        payload = {
+            "saved_at": time.time(),
+            "rows": [
+                {
+                    "guild_id": int(g),
+                    "user_id": int(u),
+                    "balance": int(b),
+                    "last_daily": ld,
+                }
+                for g, u, b, ld in rows
+            ],
+        }
+        text = json.dumps(payload)
+        for path in COIN_BACKUP_PATHS:
+            try:
+                folder = os.path.dirname(path)
+                if folder:
+                    os.makedirs(folder, exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            except Exception:
+                logger.exception("Could not write coin backup to %s", path)
+    except Exception:
+        logger.exception("save_coin_backup failed")
+
+
+def restore_coins_from_backup_if_empty():
+    """If the live DB has no coins, try to reload from a JSON backup."""
+    try:
+        live = db.execute(
+            "SELECT COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
+        ).fetchone()[0]
+        if int(live or 0) > 0:
+            return False
+        best = None
+        best_total = 0
+        for path in COIN_BACKUP_PATHS:
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                rows = data.get("rows") or []
+                total = sum(int(r.get("balance") or 0) for r in rows)
+                if total > best_total:
+                    best_total = total
+                    best = rows
+            except Exception:
+                logger.exception("Could not read coin backup %s", path)
+        if not best or best_total <= 0:
+            return False
+        for r in best:
+            db.execute(
+                "INSERT INTO galaxy_coins(guild_id,user_id,balance,last_daily) VALUES(?,?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET "
+                "balance=CASE WHEN excluded.balance > galaxy_coins.balance "
+                "THEN excluded.balance ELSE galaxy_coins.balance END, "
+                "last_daily=COALESCE(excluded.last_daily, galaxy_coins.last_daily)",
+                (
+                    int(r["guild_id"]),
+                    int(r["user_id"]),
+                    int(r.get("balance") or 0),
+                    r.get("last_daily"),
+                ),
+            )
+        db.commit()
+        logger.warning(
+            "Restored %s coin rows (%s total coins) from JSON backup",
+            len(best),
+            best_total,
+        )
+        return True
+    except Exception:
+        logger.exception("restore_coins_from_backup_if_empty failed")
+        return False
+
+
+restore_coins_from_backup_if_empty()
+save_coin_backup()
 
 recent_joins = {}
 invite_cache = {}
@@ -647,6 +740,7 @@ def change_coins(guild_id, user_id, amount):
         (guild_id, user_id, new_balance),
     )
     db.commit()
+    save_coin_backup()
 
 def set_coin_balance(guild_id, user_id, amount):
     clamped = clamp_coins(amount)
@@ -656,6 +750,7 @@ def set_coin_balance(guild_id, user_id, amount):
         (guild_id, user_id, clamped),
     )
     db.commit()
+    save_coin_backup()
 
 
 def spend_coins(guild_id, user_id, amount):
@@ -677,6 +772,7 @@ def spend_coins(guild_id, user_id, amount):
             db.rollback()
             return False, get_coin_balance(guild_id, user_id)
         db.commit()
+        save_coin_backup()
         return True, get_coin_balance(guild_id, user_id)
     except Exception:
         db.rollback()
@@ -713,6 +809,7 @@ def transfer_coins(guild_id, sender_id, recipient_id, amount):
             (guild_id, recipient_id, rec_new),
         )
         db.commit()
+        save_coin_backup()
         return True, get_coin_balance(guild_id, sender_id)
     except Exception:
         db.rollback()
@@ -1968,6 +2065,7 @@ async def galaxy_daily(ctx):
                "ON CONFLICT(guild_id,user_id) DO UPDATE SET balance=balance+excluded.balance,last_daily=CURRENT_TIMESTAMP",
                (ctx.guild.id, ctx.author.id, reward))
     db.commit()
+    save_coin_backup()
     bal = get_coin_balance(ctx.guild.id, ctx.author.id)
     await ctx.send(
         embed=build_galaxy_embed(
@@ -2028,32 +2126,21 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
         won = random.random() < 0.40
         landed = choice if won else ("tails" if choice == "heads" else "heads")
 
-    # spinning coin frames — edge / heads / edge / tails, then slow into the result
+    # short flip — a few quick frames then result (~0.8s total)
     edge = "│"
     heads_face = "🟡  **H**"
     tails_face = "⚪  **T**"
-    # fast spins, then slower, then final land
     sequence = [
-        (edge, 0.18),
-        (heads_face, 0.20),
-        (edge, 0.18),
-        (tails_face, 0.20),
-        (edge, 0.22),
-        (heads_face, 0.25),
-        (edge, 0.28),
-        (tails_face, 0.30),
-        (edge, 0.35),
-        (heads_face if landed == "heads" else tails_face, 0.40),
-        (edge, 0.45),
-        (
-            f"🪙  **{landed.upper()}**",
-            0.55,
-        ),
+        (heads_face, 0.15),
+        (edge, 0.12),
+        (tails_face, 0.15),
+        (edge, 0.12),
+        (f"🪙  **{landed.upper()}**", 0.20),
     ]
 
     spin = await ctx.send(
         embed=build_galaxy_embed(
-            f"{bet_line}\n\n```\n  {edge}\n```\n*The coin goes up...*",
+            f"{bet_line}\n\n```\n  {edge}\n```\n*Flipping...*",
             title="GALAXY  /  COINFLIP",
             color=GALAXY_ACCENT,
             footer="GALAXY  ·  CASINO",
@@ -2074,7 +2161,7 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
         except (discord.NotFound, discord.HTTPException):
             break
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.15)
 
     if won:
         change_coins(ctx.guild.id, ctx.author.id, amount * 2)
