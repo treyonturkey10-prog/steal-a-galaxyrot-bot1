@@ -69,6 +69,7 @@ GALAXY_LEADERBOARD_INTERVAL_SECONDS = 3 * 60 * 60  # Every 3 hours.
 
 # All 20 staff role IDs supplied in the screenshots.
 ROLE_IDS = {
+    "main_founder": 1575010839700967465,
     "founder": 1574537379803431036,
     "co_owner": 1550545604839735416,
     "dev": 1561622770855706705,
@@ -104,7 +105,7 @@ PERM_ROLE_IDS = {
         ROLE_IDS["trial_director"], ROLE_IDS["senior_drc"],
         ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
     },
-    6: {ROLE_IDS["founder"], ROLE_IDS["co_owner"]},
+    6: {ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"]},
 }
 PERM1_ROLE_IDS = set().union(*PERM_ROLE_IDS.values())
 ROLE_RANK = {role_id: level for level, role_ids in PERM_ROLE_IDS.items() for role_id in role_ids}
@@ -113,7 +114,7 @@ ROLE_RANK = {role_id: level for level, role_ids in PERM_ROLE_IDS.items() for rol
 MEMBER_ROLE_ID = 1549925555736936468
 MEMBER_ALLOWED_COMMANDS = {
     "balance", "bal", "coins", "leaderboard", "topcoins", "richest",
-    "daily", "gamble", "coinflip", "cf", "slots", "givecoins", "paycoins",
+    "daily", "gamble", "coinflip", "cf", "slots", "dice", "roll", "givecoins", "paycoins",
     "tipcoins", "tradecoins", "trade", "avatar", "userinfo",
 }
 
@@ -387,8 +388,13 @@ db.execute("""CREATE TABLE IF NOT EXISTS galaxy_coins (
 # remembers when the last riddle was posted so restarts don't spam a new one
 db.execute("""CREATE TABLE IF NOT EXISTS galaxy_meta (
     guild_id INTEGER PRIMARY KEY,
-    last_riddle_at REAL
+    last_riddle_at REAL,
+    leaderboard_message_id INTEGER
 )""")
+try:
+    db.execute("ALTER TABLE galaxy_meta ADD COLUMN leaderboard_message_id INTEGER")
+except sqlite3.OperationalError:
+    pass  # column already exists on older DBs
 db.commit()
 
 recent_joins = {}
@@ -863,6 +869,13 @@ async def on_ready():
         f"DELETE FROM staff_strikes WHERE datetime(created_at) <= datetime('now', '-{STAFF_STRIKE_EXPIRE_DAYS} days')"
     )
     db.commit()
+    try:
+        await bot.change_presence(
+            activity=discord.Game(name="Steal A Galacticrot"),
+            status=discord.Status.online,
+        )
+    except Exception:
+        logger.exception("Could not set bot presence")
     logger.info("Logged in as %s (ID %s) | Prefix: %s | Guilds: %s",
                 bot.user, getattr(bot.user, "id", "unknown"), PREFIX, len(bot.guilds))
     if not intents.message_content:
@@ -1580,47 +1593,127 @@ async def galaxy_game_scheduler():
         await asyncio.sleep(sleep_for)
 
 
-def build_coin_leaderboard(guild):
+def _coin_display_name(guild, user_id):
+    """Best-effort name for the leaderboard (member nick > username > id)."""
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member.display_name
+    user = guild.get_member(user_id) or bot.get_user(user_id)
+    if user is not None:
+        return getattr(user, "display_name", None) or getattr(user, "name", None) or f"User {user_id}"
+    return f"User {user_id}"
+
+
+def build_coin_leaderboard(guild, viewer_id=None):
+    """Top 15 by balance, total economy stats, and the viewer's real rank."""
     rows = db.execute(
         "SELECT user_id, balance FROM galaxy_coins "
-        "WHERE guild_id=? AND balance > 0 ORDER BY balance DESC, user_id ASC LIMIT 10",
+        "WHERE guild_id=? AND balance > 0 "
+        "ORDER BY balance DESC, user_id ASC LIMIT 15",
         (guild.id,),
     ).fetchall()
+
+    totals = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins "
+        "WHERE guild_id=? AND balance > 0",
+        (guild.id,),
+    ).fetchone()
+    holders = int(totals[0] or 0)
+    total_coins = int(totals[1] or 0)
+
     embed = discord.Embed(
         title="GALAXY  /  COIN LEADERBOARD",
         color=GALAXY_ACCENT,
         timestamp=discord.utils.utcnow(),
     )
+
     if not rows:
-        embed.description = "No one has Galaxy Coins yet. Hit daily, win a riddle, or get trading."
+        embed.description = "No one has Galaxy Coins yet.\nClaim `+daily`, win a riddle, or get trading."
     else:
-        medals = ["🥇", "🥈", "🥉"]
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         lines = []
         for index, (user_id, balance) in enumerate(rows, start=1):
-            member = guild.get_member(user_id)
-            name = member.display_name if member else f"User {user_id}"
-            rank = medals[index - 1] if index <= 3 else f"**#{index}**"
+            bal = int(balance or 0)
+            name = discord.utils.escape_markdown(_coin_display_name(guild, user_id))
+            rank = medals.get(index, f"`#{index}`")
+            share = (bal / total_coins * 100) if total_coins > 0 else 0.0
+            you = "  ← **you**" if viewer_id and int(user_id) == int(viewer_id) else ""
             lines.append(
-                f"{rank}  **{discord.utils.escape_markdown(name)}**\n"
-                f"┗ **{int(balance):,}** Galaxy Coins"
+                f"{rank} **{name}**{you}\n"
+                f"┗ `{bal:,}` coins · `{share:.1f}%` of the economy"
             )
         embed.description = "\n".join(lines)
-    embed.set_footer(text="GALAXY  ·  TOP 10 RICHEST  ·  UPDATES EVERY 3 HOURS")
+
+    # viewer's exact rank if they asked via the command
+    if viewer_id is not None:
+        viewer_bal = get_coin_balance(guild.id, viewer_id)
+        if viewer_bal > 0:
+            higher = db.execute(
+                "SELECT COUNT(*) FROM galaxy_coins "
+                "WHERE guild_id=? AND balance > ?",
+                (guild.id, viewer_bal),
+            ).fetchone()[0]
+            # ties: people with same balance and lower user_id rank above (matches ORDER BY)
+            same_ahead = db.execute(
+                "SELECT COUNT(*) FROM galaxy_coins "
+                "WHERE guild_id=? AND balance=? AND user_id<?",
+                (guild.id, viewer_bal, viewer_id),
+            ).fetchone()[0]
+            rank_num = int(higher or 0) + int(same_ahead or 0) + 1
+            embed.add_field(
+                name="Your rank",
+                value=f"**#{rank_num}** · `{viewer_bal:,}` coins",
+                inline=True,
+            )
+        else:
+            embed.add_field(
+                name="Your rank",
+                value="Unranked · `0` coins",
+                inline=True,
+            )
+
+    embed.add_field(name="Players", value=f"**{holders:,}** with coins", inline=True)
+    embed.add_field(name="Total coins", value=f"**{total_coins:,}**", inline=True)
+    embed.set_footer(text="GALAXY  ·  TOP 15  ·  LIVE FROM DATABASE  ·  AUTO EVERY 3H")
     return embed
 
 
 async def galaxy_leaderboard_scheduler():
+    """Keep one leaderboard message per guild updated instead of spamming new ones."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         for guild in bot.guilds:
             channel = await fetch_guild_text_channel(guild, GALAXY_LEADERBOARD_CHANNEL_ID)
             if channel is None or not isinstance(channel, discord.TextChannel):
                 continue
-            try:
-                await channel.send(embed=build_coin_leaderboard(guild),
-                                   allowed_mentions=discord.AllowedMentions.none())
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+            embed = build_coin_leaderboard(guild)
+            row = db.execute(
+                "SELECT leaderboard_message_id FROM galaxy_meta WHERE guild_id=?",
+                (guild.id,),
+            ).fetchone()
+            msg_id = int(row[0]) if row and row[0] else None
+            sent_or_edited = False
+            if msg_id:
+                try:
+                    existing = await channel.fetch_message(msg_id)
+                    await existing.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                    sent_or_edited = True
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    sent_or_edited = False
+            if not sent_or_edited:
+                try:
+                    new_msg = await channel.send(
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    db.execute(
+                        "INSERT INTO galaxy_meta(guild_id, leaderboard_message_id) VALUES(?, ?) "
+                        "ON CONFLICT(guild_id) DO UPDATE SET leaderboard_message_id=excluded.leaderboard_message_id",
+                        (guild.id, new_msg.id),
+                    )
+                    db.commit()
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception("Could not post coin leaderboard in guild %s", guild.id)
         await asyncio.sleep(GALAXY_LEADERBOARD_INTERVAL_SECONDS)
 
 
@@ -1716,7 +1809,7 @@ async def galaxy_set_coins(ctx, member: FlexibleMember, amount: str, *, reason="
 
 @bot.command(name="leaderboard", aliases=["topcoins", "richest"])
 async def galaxy_coin_leaderboard(ctx):
-    await ctx.send(embed=build_coin_leaderboard(ctx.guild))
+    await ctx.send(embed=build_coin_leaderboard(ctx.guild, viewer_id=ctx.author.id))
 
 
 @bot.command(name="daily")
@@ -1734,27 +1827,38 @@ async def galaxy_daily(ctx):
                 return await ctx.send(f"You’ve already claimed today’s reward. Come back in **{hours}h {minutes}m**.")
         except ValueError:
             pass
-    reward = 250
+    reward = random.randint(200, 350)
     db.execute("INSERT INTO galaxy_coins(guild_id,user_id,balance,last_daily) VALUES(?,?,?,CURRENT_TIMESTAMP) "
                "ON CONFLICT(guild_id,user_id) DO UPDATE SET balance=balance+excluded.balance,last_daily=CURRENT_TIMESTAMP",
                (ctx.guild.id, ctx.author.id, reward))
     db.commit()
-    await ctx.send(f"🎁 Daily coins claimed — **+{reward:,}**. You now have **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**.")
+    bal = get_coin_balance(ctx.guild.id, ctx.author.id)
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"🎁 {ctx.author.mention} claimed their daily drop!\n\n"
+            f"**+{reward:,}** Galaxy Coins\n"
+            f"Balance: **{bal:,}**",
+            title="GALAXY  /  DAILY",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  COINS",
+        )
+    )
 
 @bot.command(name="coinflip", aliases=["cf", "gamble"])
-@commands.cooldown(1, 3, commands.BucketType.user)
+@commands.cooldown(1, 2, commands.BucketType.user)
 async def galaxy_gamble(ctx, amount: str, side: str = None):
-    # amount can be a number, 2k, 1m, or "all"
-    # optional side: heads / h / tails / t
-    # your side only lands about 40% of the time (house edge)
+    """Flip a coin. +cf 500 heads · +cf all t · +cf 2k"""
     try:
         amount = parse_coin_amount(amount, current_balance=get_coin_balance(ctx.guild.id, ctx.author.id))
     except ValueError:
-        return await ctx.send(f"Enter a valid bet (example: `{PREFIX}cf 100`, `{PREFIX}cf 2k heads`, `{PREFIX}cf all tails`).")
+        return await ctx.send(
+            f"Enter a valid bet.\n"
+            f"Examples: `{PREFIX}cf 100` · `{PREFIX}cf 2k heads` · `{PREFIX}cf all tails`"
+        )
     if amount < 1:
-        return await ctx.send("You’ll need to bet at least **1 Galaxy Coin**.")
+        return await ctx.send("Minimum bet is **1 Galaxy Coin**.")
     if amount > MAX_SQLITE_INT:
-        return await ctx.send("That bet amount is too large.")
+        return await ctx.send("That bet is way too large.")
 
     choice = None
     if side is not None:
@@ -1764,65 +1868,278 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
         elif cleaned in ("tails", "tail", "t"):
             choice = "tails"
         else:
-            return await ctx.send(f"Side has to be **heads** or **tails** (or just leave it blank). Example: `{PREFIX}cf 250 tails`")
+            return await ctx.send(
+                f"Side has to be **heads** or **tails** (or leave it blank).\n"
+                f"Example: `{PREFIX}cf 250 tails`"
+            )
 
     success, balance = spend_coins(ctx.guild.id, ctx.author.id, amount)
     if not success:
         return await ctx.send(f"You only have **{balance:,} Galaxy Coins**.")
 
-    # 40% chance your picked side wins. if they didn't pick, just 50/50
+    bet_line = (
+        f"🪙 {ctx.author.mention} bet **{amount:,}**"
+        + (f" on **{choice}**" if choice else "")
+    )
+
+    # decide the outcome first so the last flip frame can match the result
     if choice is None:
         landed = "heads" if random.random() < 0.5 else "tails"
-        won = landed == "heads"  # keep old flavour when no side given
+        won = landed == "heads"
     else:
-        # player-favoured side only hits ~40% of the time
-        player_wins = random.random() < 0.40
-        if player_wins:
-            landed = choice
-            won = True
-        else:
-            landed = "tails" if choice == "heads" else "heads"
-            won = False
+        won = random.random() < 0.47
+        landed = choice if won else ("tails" if choice == "heads" else "heads")
+
+    # multi-frame flip animation
+    flip_frames = [
+        "🟡   · · ·",
+        "🪙  **HEADS**",
+        "⚪   · · ·",
+        "🪙  **TAILS**",
+        "🟡   · · ·",
+        "🪙  **HEADS**",
+        "⚪   · · ·",
+        "🪙  **TAILS**",
+        "🟡   · · ·",
+        f"🪙  **{landed.upper()}**",
+    ]
+
+    spin = await ctx.send(
+        embed=build_galaxy_embed(
+            f"{bet_line}\n\n{flip_frames[0]}\n\n*Flipping...*",
+            title="GALAXY  /  COINFLIP",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  CASINO",
+        )
+    )
+    for frame in flip_frames[1:]:
+        await asyncio.sleep(0.35)
+        try:
+            await spin.edit(
+                embed=build_galaxy_embed(
+                    f"{bet_line}\n\n{frame}\n\n*Flipping...*",
+                    title="GALAXY  /  COINFLIP",
+                    color=GALAXY_ACCENT,
+                    footer="GALAXY  ·  CASINO",
+                )
+            )
+        except (discord.NotFound, discord.HTTPException):
+            break
+
+    await asyncio.sleep(0.4)
 
     if won:
         change_coins(ctx.guild.id, ctx.author.id, amount * 2)
-        await ctx.send(
-            f"🪙 **{landed.title()} — You won!** Net profit: **+{amount:,}** "
-            f"Galaxy Coins. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**."
+        new_bal = get_coin_balance(ctx.guild.id, ctx.author.id)
+        panel = build_galaxy_embed(
+            f"🪙 It landed on **{landed.upper()}**!\n\n"
+            f"{ctx.author.mention} **won +{amount:,}** Galaxy Coins\n"
+            f"Balance: **{new_bal:,}**",
+            title="GALAXY  /  YOU WON",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  CASINO",
         )
     else:
-        await ctx.send(
-            f"🪙 **{landed.title()} — You lost!** You lost **{amount:,}** "
-            f"Galaxy Coins. Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**."
+        new_bal = get_coin_balance(ctx.guild.id, ctx.author.id)
+        panel = build_galaxy_embed(
+            f"🪙 It landed on **{landed.upper()}**.\n\n"
+            f"{ctx.author.mention} **lost -{amount:,}** Galaxy Coins\n"
+            f"Balance: **{new_bal:,}**",
+            title="GALAXY  /  YOU LOST",
+            color=ERROR_COLOR,
+            footer="GALAXY  ·  CASINO",
         )
+    try:
+        await spin.edit(embed=panel)
+    except (discord.NotFound, discord.HTTPException):
+        await ctx.send(embed=panel)
+
 
 @bot.command(name="slots")
-@commands.cooldown(1, 3, commands.BucketType.user)
+@commands.cooldown(1, 2, commands.BucketType.user)
 async def galaxy_slots(ctx, amount: str):
+    """Spin the slots. 💎 is rare and pays big."""
     try:
         amount = parse_coin_amount(amount, current_balance=get_coin_balance(ctx.guild.id, ctx.author.id))
     except ValueError:
-        return await ctx.send("Enter a valid bet amount (for example: `100`, `2k`, `1m`, or `all`).")
+        return await ctx.send(f"Enter a valid bet (example: `{PREFIX}slots 100`, `{PREFIX}slots 2k`, `{PREFIX}slots all`).")
     if amount < 1:
-        return await ctx.send("You’ll need to bet at least **1 Galaxy Coin**.")
+        return await ctx.send("Minimum bet is **1 Galaxy Coin**.")
     if amount > MAX_SQLITE_INT:
-        return await ctx.send("That bet amount is too large.")
+        return await ctx.send("That bet is way too large.")
     success, balance = spend_coins(ctx.guild.id, ctx.author.id, amount)
     if not success:
         return await ctx.send(f"You only have **{balance:,} Galaxy Coins**.")
-    symbols = ["🌌", "⭐", "🪐", "💎", "☄️"]
-    result = [random.choice(symbols) for _ in range(3)]
+
+    # weighted reel — 💎 is the rare one
+    reel_pool = (
+        ["🌌"] * 30
+        + ["⭐"] * 25
+        + ["🪐"] * 20
+        + ["☄️"] * 15
+        + ["💎"] * 10
+    )
+    show_pool = ["🌌", "⭐", "🪐", "☄️", "💎"]
+
+    result = [random.choice(reel_pool) for _ in range(3)]
+    bet_line = f"🎰 {ctx.author.mention} spun for **{amount:,}**"
+
+    spin = await ctx.send(
+        embed=build_galaxy_embed(
+            f"{bet_line}\n\n『 ❔  │  ❔  │  ❔ 』\n\n*Rolling...*",
+            title="GALAXY  /  SLOTS",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  CASINO",
+        )
+    )
+    # animate a few random reel frames, then lock in the real result
+    for _ in range(5):
+        await asyncio.sleep(0.32)
+        fake = [random.choice(show_pool) for _ in range(3)]
+        try:
+            await spin.edit(
+                embed=build_galaxy_embed(
+                    f"{bet_line}\n\n『 {fake[0]}  │  {fake[1]}  │  {fake[2]} 』\n\n*Rolling...*",
+                    title="GALAXY  /  SLOTS",
+                    color=GALAXY_ACCENT,
+                    footer="GALAXY  ·  CASINO",
+                )
+            )
+        except (discord.NotFound, discord.HTTPException):
+            break
+    await asyncio.sleep(0.35)
+
+    reels = f"『 {result[0]}  │  {result[1]}  │  {result[2]} 』"
+
     if result[0] == result[1] == result[2]:
-        payout = amount * 6  # Stake returned plus 5x net winnings.
+        if result[0] == "💎":
+            mult, tag = 12, "💎 MEGA JACKPOT"
+        elif result[0] == "☄️":
+            mult, tag = 8, "☄️ SUPER WIN"
+        elif result[0] == "🪐":
+            mult, tag = 6, "🪐 JACKPOT"
+        else:
+            mult, tag = 5, "⭐ TRIPLE"
+        payout = amount * mult
         change_coins(ctx.guild.id, ctx.author.id, payout)
-        outcome = f"JACKPOT! **+{amount * 5:,} net coins**"
-    elif len(set(result)) == 2:
-        payout = amount * 2  # Stake returned plus 1x net winnings.
-        change_coins(ctx.guild.id, ctx.author.id, payout)
-        outcome = f"Two match! **+{amount:,} net coins**"
+        net = payout - amount
+        panel = build_galaxy_embed(
+            f"{reels}\n\n"
+            f"**{tag}** — paid **{mult}x**\n"
+            f"{ctx.author.mention} net **+{net:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  JACKPOT",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
+    elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
+        change_coins(ctx.guild.id, ctx.author.id, amount * 2)
+        panel = build_galaxy_embed(
+            f"{reels}\n\n"
+            f"**Two match!** — paid **2x**\n"
+            f"{ctx.author.mention} net **+{amount:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  NICE HIT",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
     else:
-        outcome = f"No match. **-{amount:,} coins**"
-    await ctx.send(f"🎰 {' | '.join(result)}\n{outcome}\nBalance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**")
+        panel = build_galaxy_embed(
+            f"{reels}\n\n"
+            f"**No match.**\n"
+            f"{ctx.author.mention} lost **-{amount:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  NO LUCK",
+            color=ERROR_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
+    try:
+        await spin.edit(embed=panel)
+    except (discord.NotFound, discord.HTTPException):
+        await ctx.send(embed=panel)
+
+
+@bot.command(name="dice", aliases=["roll"])
+@commands.cooldown(1, 2, commands.BucketType.user)
+async def galaxy_dice(ctx, amount: str):
+    """Roll a d6. 4–5 pays 1.5x, 6 pays 3x. 1–3 loses."""
+    try:
+        amount = parse_coin_amount(amount, current_balance=get_coin_balance(ctx.guild.id, ctx.author.id))
+    except ValueError:
+        return await ctx.send(f"Enter a valid bet (example: `{PREFIX}dice 100`, `{PREFIX}dice all`).")
+    if amount < 1:
+        return await ctx.send("Minimum bet is **1 Galaxy Coin**.")
+    if amount > MAX_SQLITE_INT:
+        return await ctx.send("That bet is way too large.")
+    success, balance = spend_coins(ctx.guild.id, ctx.author.id, amount)
+    if not success:
+        return await ctx.send(f"You only have **{balance:,} Galaxy Coins**.")
+
+    roll = random.randint(1, 6)
+    bet_line = f"🎲 {ctx.author.mention} wagered **{amount:,}**"
+    spin = await ctx.send(
+        embed=build_galaxy_embed(
+            f"{bet_line}\n\n🎲 · · ·\n\n*Rolling the die...*",
+            title="GALAXY  /  DICE",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  CASINO",
+        )
+    )
+    for face in (random.randint(1, 6) for _ in range(4)):
+        await asyncio.sleep(0.3)
+        try:
+            await spin.edit(
+                embed=build_galaxy_embed(
+                    f"{bet_line}\n\n🎲 **{face}**\n\n*Rolling the die...*",
+                    title="GALAXY  /  DICE",
+                    color=GALAXY_ACCENT,
+                    footer="GALAXY  ·  CASINO",
+                )
+            )
+        except (discord.NotFound, discord.HTTPException):
+            break
+    await asyncio.sleep(0.35)
+
+    if roll == 6:
+        payout = int(amount * 3)
+        change_coins(ctx.guild.id, ctx.author.id, payout)
+        net = payout - amount
+        panel = build_galaxy_embed(
+            f"🎲 Rolled a **{roll}**!\n\n"
+            f"**Critical!** paid **3x**\n"
+            f"{ctx.author.mention} net **+{net:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  BIG ROLL",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
+    elif roll >= 4:
+        payout = int(amount * 1.5)
+        change_coins(ctx.guild.id, ctx.author.id, payout)
+        net = payout - amount
+        panel = build_galaxy_embed(
+            f"🎲 Rolled a **{roll}**!\n\n"
+            f"**Win!** paid **1.5x**\n"
+            f"{ctx.author.mention} net **+{net:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  YOU HIT",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
+    else:
+        panel = build_galaxy_embed(
+            f"🎲 Rolled a **{roll}**.\n\n"
+            f"**Bust.**\n"
+            f"{ctx.author.mention} lost **-{amount:,}** Galaxy Coins\n"
+            f"Balance: **{get_coin_balance(ctx.guild.id, ctx.author.id):,}**",
+            title="GALAXY  /  BUST",
+            color=ERROR_COLOR,
+            footer="GALAXY  ·  CASINO",
+        )
+    try:
+        await spin.edit(embed=panel)
+    except (discord.NotFound, discord.HTTPException):
+        await ctx.send(embed=panel)
 
 
 def require_ban():
@@ -1926,7 +2243,7 @@ async def perms(ctx):
         5: ["head_admin", "assistant_staff_manager", "staff_manager", "manager",
             "assistant_head_manager", "head_manager", "trial_director", "senior_drc",
             "drc", "axelle", "dev"],
-        6: ["founder", "co_owner"],
+        6: ["main_founder", "founder", "co_owner"],
     }
     labels = {1: "MODERATION", 2: "SENIOR MODERATION", 3: "ADMINISTRATION",
               4: "SENIOR ADMINISTRATION", 5: "LEADERSHIP", 6: "OWNERSHIP"}
@@ -3294,7 +3611,7 @@ async def help(ctx):
         name="GALAXY COINS",
         value=(
             f"`{PREFIX}balance` / `{PREFIX}bal`  `{PREFIX}daily`  `{PREFIX}tradecoins` / `{PREFIX}givecoins`\n"
-            f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}cf all tails`  `{PREFIX}slots`  `{PREFIX}leaderboard`\n"
+            f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}slots`  `{PREFIX}dice`  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
             "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
             "(your side lands ~40% of the time). Riddles post every 1h 30m — reply to the riddle message "
@@ -3310,7 +3627,7 @@ async def help(ctx):
             "**Perm 3 — Admin:** Inherits Perm 1–2 and gets `+kick`.\n"
             "**Perm 4 — Senior Admin / Junior Admin:** Inherits Perm 1–3 and gets `+ban`.\n"
             "**Perm 5 — Head Admin / Management / DRC / Dev / Axelle:** Inherits Perm 1–4; staff-strike tools.\n"
-            "**Perm 6 — Founder / Co-Owner:** All permission levels, including `+bl` / `+blacklist`.\n\n"
+            "**Perm 6 — Main Founder / Founder / Co-Owner:** All permission levels, including `+bl` / `+blacklist`.\n\n"
             "Higher permission levels inherit lower-level access. Staff can moderate only "
             "members below their rank; equal- or higher-ranked staff are protected."
         ),
