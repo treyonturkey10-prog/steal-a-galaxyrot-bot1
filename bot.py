@@ -53,6 +53,10 @@ STAFF_STRIKE_LEVEL_ROLE_IDS = (
 STAFF_STRIKE_EXPIRE_DAYS = 15
 GIVEAWAY_BOT_ID = 530082442967646230
 GIVEAWAY_PING_ROLE_ID = 1549926161054695514
+# Staff app form bot posts into this channel — ping managers when it does
+STAFF_APP_CHANNEL_ID = 1560306013238857728
+STAFF_APP_BOT_USER_ID = 853327905357561948
+STAFF_APP_PING_ROLE_ID = 1568324149791694878
 MAX_SQLITE_INT = (1 << 63) - 1
 JOIN_WINDOW_SECONDS = int(os.getenv("JOIN_WINDOW_SECONDS", "20"))
 JOIN_BURST_LIMIT = int(os.getenv("JOIN_BURST_LIMIT", "6"))
@@ -1269,6 +1273,34 @@ async def on_message(message):
         except (discord.Forbidden, discord.HTTPException):
             logger.exception("Failed to send giveaway ping in channel %s", message.channel.id)
         return
+
+    # staff application form posts into the apps channel — alert the manager team
+    if (
+        message.channel.id == STAFF_APP_CHANNEL_ID
+        and message.author.id == STAFF_APP_BOT_USER_ID
+    ):
+        ping = f"<@&{STAFF_APP_PING_ROLE_ID}>"
+        panel = build_galaxy_embed(
+            f"{ping} there's been a new staff application that's been submitted — "
+            f"just wanted to let the manager team know.",
+            title="GALAXY  /  STAFF APPLICATION",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  STAFF APPS",
+        )
+        try:
+            await message.channel.send(
+                content=ping,
+                embed=panel,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=[discord.Object(id=STAFF_APP_PING_ROLE_ID)],
+                    users=False,
+                    everyone=False,
+                ),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Failed to ping managers for staff application in %s", message.channel.id)
+        return
+
     if message.author.bot:
         return
     # Never run content filtering against commands. This keeps command messages
