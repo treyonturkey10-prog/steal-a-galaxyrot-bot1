@@ -335,15 +335,85 @@ bot = commands.Bot(
     cls=GalaxyContext,
     allowed_mentions=discord.AllowedMentions.none(),
 )
-# Coins live in sqlite. NEVER delete this file on deploy or balances reset.
-# Prefer a mounted volume (/data) when present, otherwise sit next to the bot file.
-# Override anytime with env DATABASE_PATH=/path/to/raiders.sqlite3
-if os.getenv("DATABASE_PATH"):
-    DATABASE_PATH = os.getenv("DATABASE_PATH")
+# Coins live in sqlite. The bot NEVER deletes galaxy_coins rows on startup.
+# On hosts like Railway, the app folder is wiped every deploy — mount a volume
+# and set DATABASE_PATH to a file on that volume, or balances will look "reset".
+def _sqlite_coin_total(path):
+    """Return total coins stored in a db file, or -1 if the file can't be read."""
+    if not path or not os.path.isfile(path):
+        return -1
+    try:
+        conn = sqlite3.connect(path, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='galaxy_coins'"
+            ).fetchone()
+            if not row:
+                return 0
+            total = conn.execute(
+                "SELECT COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
+            ).fetchone()[0]
+            return int(total or 0)
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_env_db = (os.getenv("DATABASE_PATH") or "").strip()
+_candidates = []
+for path in (
+    _env_db,
+    "/data/raiders.sqlite3",
+    "/app/data/raiders.sqlite3",
+    os.path.join(_script_dir, "raiders.sqlite3"),
+    os.path.join(_script_dir, "data", "raiders.sqlite3"),
+    "raiders.sqlite3",
+):
+    if path and path not in _candidates:
+        _candidates.append(path)
+
+# Prefer whichever existing file already holds the most coins (stops "lost" balances
+# when a deploy switches folders). Fall back to env path, then /data, then local.
+_best_path = None
+_best_total = -1
+for path in _candidates:
+    total = _sqlite_coin_total(path)
+    logger.info("DB candidate %s → coin total %s", path, total)
+    if total > _best_total:
+        _best_total = total
+        _best_path = path
+
+if _env_db:
+    # honor explicit env, but if it's empty and another candidate has coins, copy them in
+    DATABASE_PATH = _env_db
+    if _sqlite_coin_total(DATABASE_PATH) <= 0 and _best_path and _best_total > 0 and os.path.abspath(_best_path) != os.path.abspath(DATABASE_PATH):
+        try:
+            database_dir = os.path.dirname(DATABASE_PATH)
+            if database_dir:
+                os.makedirs(database_dir, exist_ok=True)
+            import shutil
+            shutil.copy2(_best_path, DATABASE_PATH)
+            # also copy WAL/SHM if present so we don't lose recent writes
+            for suffix in ("-wal", "-shm"):
+                side = _best_path + suffix
+                if os.path.isfile(side):
+                    shutil.copy2(side, DATABASE_PATH + suffix)
+            logger.warning(
+                "Restored coin database from %s → %s (%s total coins)",
+                _best_path, DATABASE_PATH, _best_total,
+            )
+        except Exception:
+            logger.exception("Failed to restore coin database from %s", _best_path)
+            DATABASE_PATH = _best_path
+elif _best_path and _best_total > 0:
+    DATABASE_PATH = _best_path
 elif os.path.isdir("/data"):
     DATABASE_PATH = "/data/raiders.sqlite3"
 else:
-    DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raiders.sqlite3")
+    DATABASE_PATH = os.path.join(_script_dir, "raiders.sqlite3")
+
 database_dir = os.path.dirname(DATABASE_PATH)
 if database_dir:
     os.makedirs(database_dir, exist_ok=True)
@@ -352,7 +422,7 @@ db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA synchronous=FULL")  # safer against sudden process kills
 db.execute("PRAGMA foreign_keys=ON")
 db.execute("PRAGMA busy_timeout=30000")
-logger.info("Coin/strike database: %s", os.path.abspath(DATABASE_PATH))
+logger.info("Coin/strike database in use: %s", os.path.abspath(DATABASE_PATH))
 db.execute("""CREATE TABLE IF NOT EXISTS warnings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
@@ -4050,4 +4120,3 @@ if not TOKEN:
     raise SystemExit("Galaxy Bot cannot start: DISCORD_TOKEN is missing. Add DISCORD_TOKEN=your_bot_token to the host environment or .env file, then restart.")
 
 bot.run(TOKEN)
- 
