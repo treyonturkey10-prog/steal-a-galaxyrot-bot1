@@ -249,6 +249,40 @@ def build_galaxy_embed(content=None, *, title=None, color=None, footer="GALAXY  
     return embed
 
 
+def build_mod_action_embed(
+    *,
+    action_title,
+    member_display,
+    reason,
+    moderator,
+    case_id=None,
+    extra_fields=None,
+    color=None,
+    thumbnail_url=None,
+):
+    """Staff action panel — warn / kick / ban / timeout / vc / etc."""
+    embed = discord.Embed(
+        title=action_title,
+        color=color or WARN_COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+    safe_reason = discord.utils.escape_markdown(
+        discord.utils.escape_mentions(str(reason or "No reason provided"))
+    )
+    embed.add_field(name="Member", value=str(member_display), inline=True)
+    embed.add_field(name="Staff", value=str(moderator), inline=True)
+    if case_id is not None:
+        embed.add_field(name="Case", value=f"`#{case_id}`", inline=True)
+    embed.add_field(name="Reason", value=safe_reason[:1024], inline=False)
+    if extra_fields:
+        for name, value, inline in extra_fields:
+            embed.add_field(name=name, value=value, inline=inline)
+    if thumbnail_url:
+        embed.set_thumbnail(url=thumbnail_url)
+    embed.set_footer(text="Steal A Galacticrot  ·  moderation")
+    return embed
+
+
 async def send_panel(destination, content=None, *, title=None, color=None, embed=None, **kwargs):
     """Send a Galaxy panel to any channel/messageable (not only ctx)."""
     if destination is None:
@@ -1500,7 +1534,7 @@ async def snipe(ctx):
     if len(safe_content) > 3500:
         safe_content = safe_content[:3497] + "..."
     panel = discord.Embed(
-        title="RECENTLY DELETED MESSAGE",
+        title="GALAXY  /  SNIPE",
         description=safe_content,
         color=GALAXY_COLOR,
         timestamp=deleted["deleted_at"],
@@ -1745,7 +1779,15 @@ async def galaxy_leaderboard_scheduler():
 async def galaxy_balance(ctx, member: FlexibleMember = None):
     member = member or ctx.author
     balance = get_coin_balance(ctx.guild.id, member.id)
-    await ctx.send(f"🌌 **{member.display_name}** has **{balance:,} Galaxy Coins**.")
+    embed = discord.Embed(
+        title="GALAXY  /  BALANCE",
+        description=f"{member.mention}\n**{balance:,}** Galaxy Coins",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="GALAXY  ·  COINS")
+    await ctx.send(embed=embed)
 
 @bot.command(name="tradecoins", aliases=["trade", "givecoins", "paycoins", "tipcoins"])
 @commands.cooldown(1, 3, commands.BucketType.user)
@@ -2332,21 +2374,54 @@ async def warn(ctx, member: FlexibleMember, *, reason="No reason provided"):
     warning_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
     sanction_id = record_sanction(ctx.guild.id, member.id, ctx.author.id, "Warn", reason,
                                   source_warning_id=warning_id)
-    await ctx.send(f"⚠️ {member.mention} has received a warning.\n**Reason:** {reason}\n**Case:** `#{sanction_id}`")
-    await send_mod_log(ctx.guild, f"⚠️ **Warning**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
+    warn_count = db.execute(
+        "SELECT COUNT(*) FROM warnings WHERE guild_id=? AND user_id=?",
+        (ctx.guild.id, member.id),
+    ).fetchone()[0]
+    panel = build_mod_action_embed(
+        action_title="Warning issued",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        extra_fields=[("Active warnings", f"`{warn_count}`", True)],
+        color=WARN_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
+    await send_mod_log(
+        ctx.guild,
+        f"⚠️ **Warning**\nUser: {member} (`{member.id}`)\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}\nCase: #{sanction_id}",
+    )
 
 
 @bot.command()
 @require_perm1()
 async def warnings(ctx, member: FlexibleMember):
     rows = db.execute(
-        "SELECT id, reason, created_at FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 10",
+        "SELECT id, reason, created_at, moderator_id FROM warnings "
+        "WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 10",
         (ctx.guild.id, member.id),
     ).fetchall()
+    embed = discord.Embed(
+        title="GALAXY  /  WARNING HISTORY",
+        color=WARN_COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name="STEAL A GALACTICROT  ·  MODERATION")
+    embed.description = f"Records for {member.mention} (`{member.id}`)"
     if not rows:
-        return await ctx.send(f"{member} has no recorded warnings.")
-    lines = [f"`#{row[0]}` {row[1]} — {row[2]}" for row in rows]
-    await ctx.send(f"Warnings for {member.mention}:\n" + "\n".join(lines))
+        embed.add_field(name="Warnings", value="No warnings on record.", inline=False)
+    else:
+        lines = []
+        for row in rows:
+            wid, reason, created_at, mod_id = row
+            safe = discord.utils.escape_markdown(discord.utils.escape_mentions(reason or "No reason"))
+            lines.append(f"`#{wid}` — {safe}\n┗ <@{mod_id}> · {created_at}")
+        embed.add_field(name=f"Latest {len(rows)}", value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="GALAXY  ·  STAFF ACTION")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
@@ -2368,7 +2443,14 @@ async def clearwarns(ctx, member: FlexibleMember):
         )
     db.execute("DELETE FROM warnings WHERE guild_id=? AND user_id=?", (ctx.guild.id, member.id))
     db.commit()
-    await ctx.send(f"🧹 Cleared **{len(warning_ids)}** warning(s) for {member.mention}, including their matching sanction-history entries.")
+    panel = build_mod_action_embed(
+        action_title="GALAXY  /  WARNINGS CLEARED",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=f"Cleared {len(warning_ids)} warning(s) and matching sanction history.",
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        color=SUCCESS_COLOR,
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(ctx.guild, f"🧹 **Warnings cleared**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)")
 
 
@@ -2644,7 +2726,17 @@ async def tempmute(ctx, member: FlexibleMember, duration: str, *, reason="No rea
     await member.timeout(timedelta(seconds=total_seconds), reason=f"{ctx.author}: {reason}")
     sanction_id = record_sanction(ctx.guild.id, member.id, ctx.author.id, "Timeout", reason,
                                   details=f"Duration: {duration_label}")
-    await ctx.send(f"⏳ {member.mention} has been timed out for **{duration_label}**.\n**Case:** `#{sanction_id}`")
+    panel = build_mod_action_embed(
+        action_title="Timeout applied",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        extra_fields=[("Duration", f"**{duration_label}**", True)],
+        color=WARN_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
     asyncio.create_task(send_mod_log(
         ctx.guild,
         f"⏳ **Timeout**\nUser: {member} (`{member.id}`)\nDuration: {duration_label}\n"
@@ -2658,7 +2750,15 @@ async def unmute(ctx, member: FlexibleMember):
     if not can_moderate_target(ctx, member):
         return await ctx.send("You can’t unmute that member because of role hierarchy.")
     await member.timeout(None, reason=f"Timeout removed by {ctx.author}")
-    await ctx.send(f"Timeout lifted for {member.mention}. They can speak again.")
+    panel = build_mod_action_embed(
+        action_title="Timeout lifted",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason="Timeout removed — they can speak again.",
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        color=SUCCESS_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(ctx.guild, f"🔊 **Timeout removed**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)")
 
 
@@ -2725,24 +2825,29 @@ async def vcmute(ctx, member: FlexibleMember = None, duration: str = None, *, re
     if seconds:
         await _schedule_vc_lift(ctx.guild, member.id, "mute", seconds, str(ctx.author))
         label = format_duration_label(seconds)
-        await ctx.send(f"🔇 {member.mention} server-muted for **{label}**.")
-        await send_mod_log(
-            ctx.guild,
-            f"🔇 **VC mute**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
-            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
-        )
+        extras = [("Duration", f"**{label}**", True)]
     else:
-        # cancel any pending auto-unmute
         key = (ctx.guild.id, member.id, "mute")
         old = temp_vc_tasks.pop(key, None)
         if old and not old.done():
             old.cancel()
-        await ctx.send(f"🔇 {member.mention} server-muted.")
-        await send_mod_log(
-            ctx.guild,
-            f"🔇 **VC mute**\nUser: {member} (`{member.id}`)\nDuration: permanent\n"
-            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
-        )
+        label = "until unmuted"
+        extras = [("Duration", "**Permanent**", True)]
+    panel = build_mod_action_embed(
+        action_title="VC mute",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        extra_fields=extras,
+        color=WARN_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
+    await send_mod_log(
+        ctx.guild,
+        f"🔇 **VC mute**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+    )
 
 
 @bot.command(name="vcunmute", aliases=["voiceunmute", "serverunmute"])
@@ -2763,7 +2868,15 @@ async def vcunmute(ctx, member: FlexibleMember = None):
         return await ctx.send("I can’t unmute them. I need **Mute Members** and a higher role.")
     except discord.HTTPException:
         return await ctx.send("Discord couldn’t unmute them.")
-    await ctx.send(f"🔊 {member.mention} is no longer server-muted.")
+    panel = build_mod_action_embed(
+        action_title="VC unmute",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason="Server mute removed.",
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        color=SUCCESS_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(
         ctx.guild,
         f"🔊 **VC unmute**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)",
@@ -2799,23 +2912,29 @@ async def vcdeafen(ctx, member: FlexibleMember = None, duration: str = None, *, 
     if seconds:
         await _schedule_vc_lift(ctx.guild, member.id, "deafen", seconds, str(ctx.author))
         label = format_duration_label(seconds)
-        await ctx.send(f"🔇 {member.mention} server-deafened for **{label}**.")
-        await send_mod_log(
-            ctx.guild,
-            f"🔇 **VC deafen**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
-            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
-        )
+        extras = [("Duration", f"**{label}**", True)]
     else:
         key = (ctx.guild.id, member.id, "deafen")
         old = temp_vc_tasks.pop(key, None)
         if old and not old.done():
             old.cancel()
-        await ctx.send(f"🔇 {member.mention} server-deafened.")
-        await send_mod_log(
-            ctx.guild,
-            f"🔇 **VC deafen**\nUser: {member} (`{member.id}`)\nDuration: permanent\n"
-            f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
-        )
+        label = "until undeafened"
+        extras = [("Duration", "**Permanent**", True)]
+    panel = build_mod_action_embed(
+        action_title="VC deafen",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        extra_fields=extras,
+        color=WARN_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
+    await send_mod_log(
+        ctx.guild,
+        f"🔇 **VC deafen**\nUser: {member} (`{member.id}`)\nDuration: {label}\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+    )
 
 
 @bot.command(name="vcundeafen", aliases=["vcundeaf", "voiceundeafen", "serverundeafen"])
@@ -2836,7 +2955,15 @@ async def vcundeafen(ctx, member: FlexibleMember = None):
         return await ctx.send("I can’t undeafen them. I need **Deafen Members** and a higher role.")
     except discord.HTTPException:
         return await ctx.send("Discord couldn’t undeafen them.")
-    await ctx.send(f"🔊 {member.mention} is no longer server-deafened.")
+    panel = build_mod_action_embed(
+        action_title="VC undeafen",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason="Server deafen removed.",
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        color=SUCCESS_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(
         ctx.guild,
         f"🔊 **VC undeafen**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)",
@@ -2874,7 +3001,15 @@ async def ban(ctx, target_input: str, *, reason="No reason provided"):
                 target_label = f"User `{target_id}`"
             await ctx.guild.ban(discord.Object(id=target_id), reason=f"{ctx.author}: {reason}")
     sanction_id = record_sanction(ctx.guild.id, target_id, ctx.author.id, "Ban", reason)
-    await ctx.send(f"🔨 **{target_label}** has been banned.\n**Reason:** {reason}\n**Case:** `#{sanction_id}`")
+    panel = build_mod_action_embed(
+        action_title="Member banned",
+        member_display=f"{target_label}\n`{target_id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        color=ERROR_COLOR,
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(ctx.guild, f"🔨 **Ban**\nUser: {target_label} (`{target_id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
 
 
@@ -2886,7 +3021,14 @@ async def unban(ctx, user_id: int, *, reason="No reason provided"):
         await ctx.guild.unban(user, reason=f"{ctx.author}: {reason}")
     except discord.NotFound:
         return await ctx.send("I couldn’t find an active ban for that ID. Check the ID and try again.")
-    await ctx.send(f"Unbanned **{user}**.")
+    panel = build_mod_action_embed(
+        action_title="Member unbanned",
+        member_display=f"{user}\n`{user.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        color=SUCCESS_COLOR,
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(ctx.guild, f"♻️ **Unban**\nUser: {user} (`{user.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
 
 
@@ -2897,7 +3039,16 @@ async def kick(ctx, member: FlexibleMember, *, reason="No reason provided"):
         return await ctx.send("You can’t kick that member because of role hierarchy.")
     await member.kick(reason=f"{ctx.author}: {reason}")
     sanction_id = record_sanction(ctx.guild.id, member.id, ctx.author.id, "Kick", reason)
-    await ctx.send(f"👢 **{member}** has been kicked.\n**Reason:** {reason}\n**Case:** `#{sanction_id}`")
+    panel = build_mod_action_embed(
+        action_title="Member kicked",
+        member_display=f"{member.mention}\n`{member.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        color=WARN_COLOR,
+        thumbnail_url=getattr(member.display_avatar, "url", None),
+    )
+    await ctx.send(embed=panel)
     await send_mod_log(ctx.guild, f"👢 **Kick**\nUser: {member} (`{member.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
 
 
@@ -2929,10 +3080,16 @@ async def blacklist_user(ctx, user: FlexibleUser, *, reason="Blacklisted"):
     )
     db.commit()
     sanction_id = record_sanction(ctx.guild.id, user.id, ctx.author.id, "Blacklist", reason)
-    await ctx.send(
-        f"⛔ **{user}** has been **blacklisted and banned** from the server.\n"
-        f"**Reason:** {reason}\n**Case:** `#{sanction_id}`"
+    panel = build_mod_action_embed(
+        action_title="GALAXY  /  BLACKLIST",
+        member_display=f"{user}\n`{user.id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        extra_fields=[("Action", "Blacklisted + banned from the server", False)],
+        color=ERROR_COLOR,
     )
+    await ctx.send(embed=panel)
     await send_mod_log(
         ctx.guild,
         f"⛔ **Blacklist + Ban**\nUser: {user} (`{user.id}`)\n"
@@ -2987,15 +3144,34 @@ async def sanctions(ctx, user: FlexibleUser):
            FROM sanctions WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 25""",
         (ctx.guild.id, user.id),
     ).fetchall()
+    embed = discord.Embed(
+        title="Sanction history",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name=str(user), icon_url=getattr(getattr(user, "display_avatar", None), "url", None))
+    embed.description = f"{getattr(user, 'mention', user)} · `{user.id}`"
     if not rows:
-        return await ctx.send(f"📋 No recorded sanctions for **{user}** (`{user.id}`).")
-    lines = []
-    for case_id, kind, reason, details, moderator_id, created_at in rows:
-        detail_text = f" • {details}" if details else ""
-        lines.append(f"`#{case_id}` **{kind}** — {reason}{detail_text}\n  By <@{moderator_id}> • {created_at}")
-    embed = discord.Embed(title=f"Sanctions  /  {user}", description="\n".join(lines),
-                          color=discord.Color.from_rgb(111, 66, 193))
-    embed.set_footer(text=f"User ID: {user.id} • Showing up to 25 records")
+        embed.add_field(name="Records", value="No sanctions on file.", inline=False)
+    else:
+        lines = []
+        for case_id, kind, reason, details, moderator_id, created_at in rows:
+            safe = discord.utils.escape_markdown(
+                discord.utils.escape_mentions(reason or "No reason")
+            )
+            if len(safe) > 100:
+                safe = safe[:97] + "..."
+            extra = f" · {details}" if details else ""
+            lines.append(
+                f"`#{case_id}` **{kind}** — {safe}{extra}\n"
+                f"┗ <@{moderator_id}> · `{created_at}`"
+            )
+        embed.add_field(
+            name=f"{len(rows)} shown (newest first)",
+            value="\n".join(lines)[:1024],
+            inline=False,
+        )
+    embed.set_footer(text=f"Steal A Galacticrot  ·  {PREFIX}del sanction <id>")
     await ctx.send(embed=embed)
 
 
@@ -3250,7 +3426,14 @@ async def lock(ctx):
     overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = False
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Channel locked by {ctx.author}")
-    await ctx.send("🔒 Channel locked. Members can no longer send messages here.")
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"{ctx.channel.mention} is locked.\nMembers can’t send messages here until it’s unlocked.",
+            title="GALAXY  /  CHANNEL LOCKED",
+            color=WARN_COLOR,
+            footer="GALAXY  ·  STAFF ACTION",
+        )
+    )
     await send_mod_log(ctx.guild, f"🔒 **Channel locked**\nChannel: {ctx.channel.mention}\nBy: {ctx.author} (`{ctx.author.id}`)")
 
 
@@ -3260,7 +3443,14 @@ async def unlock(ctx):
     overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
     overwrite.send_messages = None
     await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Channel unlocked by {ctx.author}")
-    await ctx.send("🔓 Channel unlocked. Members can chat here again.")
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"{ctx.channel.mention} is unlocked.\nMembers can chat here again.",
+            title="GALAXY  /  CHANNEL UNLOCKED",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  STAFF ACTION",
+        )
+    )
     await send_mod_log(ctx.guild, f"🔓 **Channel unlocked**\nChannel: {ctx.channel.mention}\nBy: {ctx.author} (`{ctx.author.id}`)")
 
 
@@ -3281,7 +3471,14 @@ async def slowmode(ctx, duration: str):
         return await ctx.send("Slowmode can be anywhere from **0 seconds to 6 hours (21,600s)**.")
     await ctx.channel.edit(slowmode_delay=seconds, reason=f"Slowmode changed by {ctx.author}")
     label = "off" if seconds == 0 else format_duration_label(seconds)
-    await ctx.send(f"⏱️ Done — slowmode is now **{label}**.")
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"Slowmode in {ctx.channel.mention} is now **{label}**.",
+            title="GALAXY  /  SLOWMODE",
+            color=GALAXY_ACCENT,
+            footer="GALAXY  ·  STAFF ACTION",
+        )
+    )
     asyncio.create_task(send_mod_log(
         ctx.guild,
         f"⏱️ **Slowmode changed**\nChannel: {ctx.channel.mention}\nSlowmode: {label}\nBy: {ctx.author} (`{ctx.author.id}`)"
@@ -3530,15 +3727,29 @@ async def userinfo(ctx, target_input: str = None):
         except commands.BadArgument:
             target = await resolve_user_arg(ctx, target_input)
     is_member = isinstance(target, discord.Member)
-    embed = discord.Embed(title=f"User info — {target}", color=discord.Color.from_rgb(111, 66, 193))
+    embed = discord.Embed(
+        title="GALAXY  /  USER INFO",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name=str(target), icon_url=target.display_avatar.url)
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="User ID", value=str(target.id), inline=True)
+    embed.add_field(name="User ID", value=f"`{target.id}`", inline=True)
     embed.add_field(name="Created", value=discord.utils.format_dt(target.created_at, style="R"), inline=True)
     if is_member:
-        embed.add_field(name="Joined", value=discord.utils.format_dt(target.joined_at, style="R") if target.joined_at else "Unknown", inline=True)
+        embed.add_field(
+            name="Joined",
+            value=discord.utils.format_dt(target.joined_at, style="R") if target.joined_at else "Unknown",
+            inline=True,
+        )
         embed.add_field(name="Top role", value=target.top_role.mention, inline=True)
+        rank = effective_staff_rank(target)
+        embed.add_field(name="Staff rank", value=f"Perm **{rank}**" if rank else "Member", inline=True)
+        coins = get_coin_balance(ctx.guild.id, target.id)
+        embed.add_field(name="Galaxy Coins", value=f"**{coins:,}**", inline=True)
     else:
-        embed.add_field(name="Status", value="Not currently in server", inline=True)
+        embed.add_field(name="Status", value="Not currently in this server", inline=True)
+    embed.set_footer(text="GALAXY  ·  LOOKUP")
     await ctx.send(embed=embed)
 
 
@@ -3546,15 +3757,21 @@ async def userinfo(ctx, target_input: str = None):
 @require_perm1()
 async def serverinfo(ctx):
     guild = ctx.guild
-    embed = discord.Embed(title=f"Server info — {guild.name}", color=discord.Color.from_rgb(111, 66, 193))
+    embed = discord.Embed(
+        title="GALAXY  /  SERVER INFO",
+        description=f"**{guild.name}**",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Server ID", value=str(guild.id), inline=True)
-    embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+    embed.add_field(name="Server ID", value=f"`{guild.id}`", inline=True)
+    embed.add_field(name="Members", value=f"**{guild.member_count:,}**", inline=True)
     embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
     embed.add_field(name="Created", value=discord.utils.format_dt(guild.created_at, style="R"), inline=True)
-    embed.add_field(name="Channels", value=str(len(guild.channels)), inline=True)
-    embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="Channels", value=f"**{len(guild.channels)}**", inline=True)
+    embed.add_field(name="Roles", value=f"**{len(guild.roles)}**", inline=True)
+    embed.set_footer(text="GALAXY  ·  LOOKUP")
     await ctx.send(embed=embed)
 
 
@@ -3568,41 +3785,73 @@ async def avatar(ctx, target_input: str = None):
         except commands.BadArgument:
             target = await resolve_user_arg(ctx, target_input)
     display = getattr(target, "display_name", getattr(target, "global_name", None) or target.name)
-    embed = discord.Embed(title=f"{display}'s avatar", color=discord.Color.from_rgb(111, 66, 193))
+    embed = discord.Embed(
+        title="GALAXY  /  AVATAR",
+        description=f"**{discord.utils.escape_markdown(display)}**",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
     embed.set_image(url=target.display_avatar.url)
+    embed.set_footer(text="GALAXY  ·  LOOKUP")
     await ctx.send(embed=embed)
 
 
 @bot.command()
 @require_perm1()
 async def membercount(ctx):
-    await ctx.send(f"👥 **{ctx.guild.name}** has **{ctx.guild.member_count:,}** members.")
+    embed = discord.Embed(
+        title="GALAXY  /  MEMBER COUNT",
+        description=f"**{ctx.guild.name}** has **{ctx.guild.member_count:,}** members.",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="GALAXY  ·  LOOKUP")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
 @require_perm1()
 async def roleinfo(ctx, role: discord.Role):
-    embed = discord.Embed(title=f"Role info — {role.name}", color=role.color if role.color.value else discord.Color.blurple())
-    embed.add_field(name="Role ID", value=str(role.id), inline=True)
-    embed.add_field(name="Members", value=str(len(role.members)), inline=True)
-    embed.add_field(name="Position", value=str(role.position), inline=True)
+    embed = discord.Embed(
+        title="GALAXY  /  ROLE INFO",
+        description=f"{role.mention} · **{discord.utils.escape_markdown(role.name)}**",
+        color=role.color if role.color.value else GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Role ID", value=f"`{role.id}`", inline=True)
+    embed.add_field(name="Members", value=f"**{len(role.members):,}**", inline=True)
+    embed.add_field(name="Position", value=f"**{role.position}**", inline=True)
     embed.add_field(name="Mentionable", value="Yes" if role.mentionable else "No", inline=True)
+    embed.add_field(name="Hoisted", value="Yes" if role.hoist else "No", inline=True)
     embed.add_field(name="Created", value=discord.utils.format_dt(role.created_at, style="R"), inline=True)
+    embed.set_footer(text="GALAXY  ·  LOOKUP")
     await ctx.send(embed=embed)
 
 
 @bot.command()
 async def ping(ctx):
-    await ctx.send(f"Right here. `{round(bot.latency * 1000)} ms`")
+    ms = round(bot.latency * 1000)
+    embed = discord.Embed(
+        title="GALAXY  /  PING",
+        description=f"Right here.\nLatency: **`{ms} ms`**",
+        color=SUCCESS_COLOR if ms < 200 else WARN_COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="GALAXY  ·  STATUS")
+    await ctx.send(embed=embed)
 
 
 @bot.command()
 async def help(ctx):
     """Compact command directory, displayed as one Galaxy panel."""
     embed = discord.Embed(
-        title="Galaxy  ·  Command guide",
-        description=f"Commands use the `{PREFIX}` prefix. Reply to a member’s message to use them as the target for supported moderation commands. `{PREFIX}snipe` shows the latest deleted message in the current channel.",
+        title="GALAXY  /  COMMAND GUIDE",
+        description=(
+            f"Commands use the `{PREFIX}` prefix. Reply to a member’s message to use them as the target "
+            f"for supported moderation commands. `{PREFIX}snipe` shows the latest deleted message in this channel."
+        ),
         color=GALAXY_COLOR,
+        timestamp=discord.utils.utcnow(),
     )
     embed.add_field(
         name="START HERE",
@@ -3671,7 +3920,7 @@ async def help(ctx):
         ),
         inline=False,
     )
-    embed.set_footer(text=f"Galaxy Community  ·  Prefix: {PREFIX}")
+    embed.set_footer(text=f"GALAXY  ·  COMMAND GUIDE  ·  Prefix: {PREFIX}")
     await ctx.send(embed=embed)
 
 @bot.event
@@ -3801,3 +4050,4 @@ if not TOKEN:
     raise SystemExit("Galaxy Bot cannot start: DISCORD_TOKEN is missing. Add DISCORD_TOKEN=your_bot_token to the host environment or .env file, then restart.")
 
 bot.run(TOKEN)
+ 
