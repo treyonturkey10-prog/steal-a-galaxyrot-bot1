@@ -1,4 +1,4 @@
-import os
+ import os
 import json
 import time
 import sqlite3
@@ -300,18 +300,24 @@ bot = commands.Bot(
     cls=GalaxyContext,
     allowed_mentions=discord.AllowedMentions.none(),
 )
-# Coins, strikes, etc. live in this sqlite file. Keep DATABASE_PATH pointed at a
-# persistent disk path on your host so redeploys don't wipe balances.
-_default_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raiders.sqlite3")
-DATABASE_PATH = os.getenv("DATABASE_PATH", _default_db)
+# Coins live in sqlite. NEVER delete this file on deploy or balances reset.
+# Prefer a mounted volume (/data) when present, otherwise sit next to the bot file.
+# Override anytime with env DATABASE_PATH=/path/to/raiders.sqlite3
+if os.getenv("DATABASE_PATH"):
+    DATABASE_PATH = os.getenv("DATABASE_PATH")
+elif os.path.isdir("/data"):
+    DATABASE_PATH = "/data/raiders.sqlite3"
+else:
+    DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raiders.sqlite3")
 database_dir = os.path.dirname(DATABASE_PATH)
 if database_dir:
     os.makedirs(database_dir, exist_ok=True)
 db = sqlite3.connect(DATABASE_PATH, timeout=30)
 db.execute("PRAGMA journal_mode=WAL")
-db.execute("PRAGMA synchronous=NORMAL")
+db.execute("PRAGMA synchronous=FULL")  # safer against sudden process kills
 db.execute("PRAGMA foreign_keys=ON")
 db.execute("PRAGMA busy_timeout=30000")
+logger.info("Coin/strike database: %s", os.path.abspath(DATABASE_PATH))
 db.execute("""CREATE TABLE IF NOT EXISTS warnings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
@@ -883,6 +889,18 @@ async def on_ready():
     logger.info("Prefix commands require Message Content Intent enabled in the Discord Developer Portal.")
     logger.info("Startup diagnostics: discord.py=%s | database=%s | prefix=%r",
                 getattr(discord, "__version__", "unknown"), DATABASE_PATH, PREFIX)
+    try:
+        holders = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
+        ).fetchone()
+        logger.info(
+            "Galaxy coins intact: %s players holding %s total coins (db=%s)",
+            int(holders[0] or 0),
+            int(holders[1] or 0),
+            os.path.abspath(DATABASE_PATH),
+        )
+    except Exception:
+        logger.exception("Could not read galaxy_coins on startup")
     for guild in bot.guilds:
         await refresh_invites(guild)
         # keep strike roles honest after expiry cleanup
@@ -1560,21 +1578,26 @@ async def _post_galaxy_riddle(guild, channel):
 
 
 async def galaxy_game_scheduler():
-    # Posts a riddle every 1h30m. Last post time is saved in the DB so a code
-    # restart does NOT fire a new riddle early — it waits out the rest of the timer.
+    # Posts a riddle every 1 hour 30 minutes.
+    # last_riddle_at is saved in sqlite so code updates / restarts do NOT
+    # fire a new riddle early — the bot only posts when the full 90 minutes are up.
     await bot.wait_until_ready()
     while not bot.is_closed():
         now = time.time()
-        # figure out how long until the next riddle is due (across guilds we just
-        # use the soonest due time, then post whichever are ready)
         sleep_for = GALAXY_GAME_INTERVAL_SECONDS
         for guild in bot.guilds:
             last = _get_last_riddle_at(guild.id)
             if last is None:
-                # first ever run for this guild — wait the full interval before posting
-                remaining = GALAXY_GAME_INTERVAL_SECONDS
+                # first boot for this guild — start the 90m clock, don't post yet
+                _set_last_riddle_at(guild.id, now)
+                remaining = float(GALAXY_GAME_INTERVAL_SECONDS)
+                logger.info(
+                    "Riddle timer started for guild %s — next post in 1h 30m",
+                    guild.id,
+                )
             else:
-                remaining = GALAXY_GAME_INTERVAL_SECONDS - (now - last)
+                remaining = float(GALAXY_GAME_INTERVAL_SECONDS) - (now - last)
+
             if remaining <= 0:
                 channel = await fetch_guild_text_channel(guild, GALAXY_GAME_CHANNEL_ID)
                 if channel is None or not isinstance(channel, discord.TextChannel):
@@ -1582,13 +1605,13 @@ async def galaxy_game_scheduler():
                         "Riddle channel %s is unavailable in guild %s (%s)",
                         GALAXY_GAME_CHANNEL_ID, guild.name, guild.id
                     )
-                    # don't tight-loop if the channel is missing — pretend we posted
-                    _set_last_riddle_at(guild.id)
-                    remaining = GALAXY_GAME_INTERVAL_SECONDS
+                    # don't tight-loop if the channel is missing — push the timer forward
+                    _set_last_riddle_at(guild.id, now)
+                    remaining = float(GALAXY_GAME_INTERVAL_SECONDS)
                 else:
                     await _post_galaxy_riddle(guild, channel)
-                    remaining = GALAXY_GAME_INTERVAL_SECONDS
-            sleep_for = min(sleep_for, max(5, remaining))
+                    remaining = float(GALAXY_GAME_INTERVAL_SECONDS)
+            sleep_for = min(sleep_for, max(5.0, remaining))
 
         await asyncio.sleep(sleep_for)
 
@@ -1884,40 +1907,52 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
 
     # decide the outcome first so the last flip frame can match the result
     if choice is None:
-        landed = "heads" if random.random() < 0.5 else "tails"
+        # no side called — hard 40/60 (win only 40% of the time)
+        landed = "heads" if random.random() < 0.40 else "tails"
         won = landed == "heads"
     else:
-        won = random.random() < 0.47
+        # called a side — your pick only lands 40% of the time (60% house)
+        won = random.random() < 0.40
         landed = choice if won else ("tails" if choice == "heads" else "heads")
 
-    # multi-frame flip animation
-    flip_frames = [
-        "🟡   · · ·",
-        "🪙  **HEADS**",
-        "⚪   · · ·",
-        "🪙  **TAILS**",
-        "🟡   · · ·",
-        "🪙  **HEADS**",
-        "⚪   · · ·",
-        "🪙  **TAILS**",
-        "🟡   · · ·",
-        f"🪙  **{landed.upper()}**",
+    # spinning coin frames — edge / heads / edge / tails, then slow into the result
+    edge = "│"
+    heads_face = "🟡  **H**"
+    tails_face = "⚪  **T**"
+    # fast spins, then slower, then final land
+    sequence = [
+        (edge, 0.18),
+        (heads_face, 0.20),
+        (edge, 0.18),
+        (tails_face, 0.20),
+        (edge, 0.22),
+        (heads_face, 0.25),
+        (edge, 0.28),
+        (tails_face, 0.30),
+        (edge, 0.35),
+        (heads_face if landed == "heads" else tails_face, 0.40),
+        (edge, 0.45),
+        (
+            f"🪙  **{landed.upper()}**",
+            0.55,
+        ),
     ]
 
     spin = await ctx.send(
         embed=build_galaxy_embed(
-            f"{bet_line}\n\n{flip_frames[0]}\n\n*Flipping...*",
+            f"{bet_line}\n\n```\n  {edge}\n```\n*The coin goes up...*",
             title="GALAXY  /  COINFLIP",
             color=GALAXY_ACCENT,
             footer="GALAXY  ·  CASINO",
         )
     )
-    for frame in flip_frames[1:]:
-        await asyncio.sleep(0.35)
+
+    for frame, delay in sequence:
+        await asyncio.sleep(delay)
         try:
             await spin.edit(
                 embed=build_galaxy_embed(
-                    f"{bet_line}\n\n{frame}\n\n*Flipping...*",
+                    f"{bet_line}\n\n```\n  {frame}\n```\n*Flipping...*",
                     title="GALAXY  /  COINFLIP",
                     color=GALAXY_ACCENT,
                     footer="GALAXY  ·  CASINO",
@@ -1926,13 +1961,14 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
         except (discord.NotFound, discord.HTTPException):
             break
 
-    await asyncio.sleep(0.4)
+    await asyncio.sleep(0.5)
 
     if won:
         change_coins(ctx.guild.id, ctx.author.id, amount * 2)
         new_bal = get_coin_balance(ctx.guild.id, ctx.author.id)
         panel = build_galaxy_embed(
-            f"🪙 It landed on **{landed.upper()}**!\n\n"
+            f"```\n  🪙  {landed.upper()}\n```\n"
+            f"**It landed on {landed.upper()}!**\n\n"
             f"{ctx.author.mention} **won +{amount:,}** Galaxy Coins\n"
             f"Balance: **{new_bal:,}**",
             title="GALAXY  /  YOU WON",
@@ -1942,7 +1978,8 @@ async def galaxy_gamble(ctx, amount: str, side: str = None):
     else:
         new_bal = get_coin_balance(ctx.guild.id, ctx.author.id)
         panel = build_galaxy_embed(
-            f"🪙 It landed on **{landed.upper()}**.\n\n"
+            f"```\n  🪙  {landed.upper()}\n```\n"
+            f"**It landed on {landed.upper()}.**\n\n"
             f"{ctx.author.mention} **lost -{amount:,}** Galaxy Coins\n"
             f"Balance: **{new_bal:,}**",
             title="GALAXY  /  YOU LOST",
