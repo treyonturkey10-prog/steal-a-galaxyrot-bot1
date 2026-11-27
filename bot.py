@@ -61,7 +61,17 @@ MAX_SQLITE_INT = (1 << 63) - 1
 JOIN_WINDOW_SECONDS = int(os.getenv("JOIN_WINDOW_SECONDS", "20"))
 JOIN_BURST_LIMIT = int(os.getenv("JOIN_BURST_LIMIT", "6"))
 GALAXY_GAME_CHANNEL_ID = 1574936058121027604
-GALAXY_GAME_INTERVAL_SECONDS = 90 * 60  # New riddle every 1 hour 30 minutes.
+GALAXY_GAME_INTERVAL_SECONDS = 30 * 60  # New riddle every 30 minutes.
+# Secret answer DMs for staff oversight (not posted publicly).
+RIDDLE_ANSWER_DM_USER_ID = 1532561566271017009
+# Chance (0.0–1.0) that a scheduled/staff riddle pings the riddle role ("dead chat" ping).
+RIDDLE_PING_CHANCE = 0.45
+# On join: briefly mention the new member in these channels, then delete the pings.
+JOIN_GHOST_PING_CHANNEL_IDS = (
+    1549919146949611610,  # roles
+    1553154365362278512,  # our-ad
+    1549949873468604438,  # chat
+)
 GALAXY_QUESTION_REWARD_MIN = 50
 GALAXY_QUESTION_REWARD_MAX = 250
 GALAXY_LEADERBOARD_CHANNEL_ID = 1549950104516165682
@@ -1592,12 +1602,50 @@ async def enforce_blacklist_ban(guild, user, *, event_label="blacklisted user"):
 
 
 @bot.event
+async def ghost_ping_new_member(member):
+    """Mention a new member in key channels so they get notified, then delete the pings."""
+    guild = member.guild
+    for channel_id in JOIN_GHOST_PING_CHANNEL_IDS:
+        channel = await fetch_guild_text_channel(guild, channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            continue
+        try:
+            msg = await channel.send(
+                member.mention,
+                allowed_mentions=discord.AllowedMentions(users=[member]),
+            )
+            try:
+                await msg.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                # If delete fails, try again shortly; never leave the ping if we can help it.
+                try:
+                    await asyncio.sleep(1.0)
+                    await msg.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.warning(
+                        "Could not delete join ghost-ping in channel %s for member %s",
+                        channel_id, member.id,
+                    )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Could not send join ghost-ping in channel %s for member %s",
+                channel_id, member.id,
+            )
+
+
+@bot.event
 async def on_member_join(member):
     guild = member.guild
 
     # A database blacklist remains active until +unbl removes the record.
     if await enforce_blacklist_ban(guild, member, event_label="member rejoined"):
         return
+
+    # Ghost-ping key channels so the member is notified, without leaving messages.
+    try:
+        await ghost_ping_new_member(member)
+    except Exception:
+        logger.exception("Join ghost-ping failed for member %s", member.id)
 
     # Invite tracking only: welcome messages have intentionally been removed.
     inviter_text = await get_inviter_text(guild)
@@ -2742,6 +2790,46 @@ async def _handle_riddle_guess(channel, author, guess_text, message=None):
     return False
 
 
+async def _dm_riddle_answer(guild, channel, question, riddle_message=None):
+    """DM the configured user the answer whenever a riddle is posted."""
+    user_id = RIDDLE_ANSWER_DM_USER_ID
+    if not user_id:
+        return
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+    except (discord.NotFound, discord.HTTPException):
+        logger.warning("Could not fetch riddle-answer DM user %s", user_id)
+        return
+    jump = ""
+    if riddle_message is not None:
+        jump = f"\n[Jump to riddle]({riddle_message.jump_url})"
+    elif guild and channel:
+        jump = f"\nChannel: {channel.mention} in **{guild.name}**"
+    answer = question.get("answer", "???")
+    difficulty = question.get("difficulty", "Medium")
+    qtext = question.get("question", "???")
+    hints = question.get("hints") or []
+    hint_lines = "\n".join(f"• {h}" for h in hints[:3]) if hints else "• (none)"
+    embed = discord.Embed(
+        title="GALAXY  /  RIDDLE ANSWER (STAFF)",
+        description=(
+            f"**[{difficulty}]** {qtext}\n\n"
+            f"**Answer:** ||{discord.utils.escape_markdown(str(answer))}||\n\n"
+            f"**Hints:**\n{hint_lines}{jump}"
+        ),
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text=f"GALAXY  ·  PRIVATE  ·  guild {getattr(guild, 'id', '?')}")
+    try:
+        await user.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning(
+            "Could not DM riddle answer to %s — user must share a server and allow DMs from server members",
+            user_id,
+        )
+
+
 async def _post_galaxy_riddle(guild, channel, hint_limit=3, ping_role=True):
     RIDDLE_PING_ROLE_ID = 1549925951373058241
     previous = active_galaxy_questions.pop(guild.id, None)
@@ -2758,6 +2846,7 @@ async def _post_galaxy_riddle(guild, channel, hint_limit=3, ping_role=True):
         **question, "hints_used": 0, "wrong_guesses": 0, "message_id": None,
         "channel_id": channel.id, "hint_limit": hint_limit, "allow_channel_guesses": True,
     }
+    riddle_msg = None
     try:
         riddle_embed = build_galaxy_embed(
             f"**[{question.get('difficulty', 'Medium')} RIDDLE]**\n**{question['question']}**\n\n"
@@ -2768,8 +2857,14 @@ async def _post_galaxy_riddle(guild, channel, hint_limit=3, ping_role=True):
             title="GALAXY  /  RIDDLE", color=GALAXY_ACCENT,
             footer="GALAXY  ·  COMMUNITY GAME",
         )
-        content = f"<@&{RIDDLE_PING_ROLE_ID}>" if ping_role else None
-        allowed = discord.AllowedMentions(roles=[discord.Object(id=RIDDLE_PING_ROLE_ID)]) if ping_role else discord.AllowedMentions.none()
+        # Only sometimes ping the riddle / "dead chat" role so it doesn't spam every round.
+        do_ping = bool(ping_role) and random.random() < float(RIDDLE_PING_CHANCE)
+        content = f"<@&{RIDDLE_PING_ROLE_ID}>" if do_ping else None
+        allowed = (
+            discord.AllowedMentions(roles=[discord.Object(id=RIDDLE_PING_ROLE_ID)])
+            if do_ping
+            else discord.AllowedMentions.none()
+        )
         riddle_msg = await channel.send(content=content, embed=riddle_embed, allowed_mentions=allowed)
         active_galaxy_questions[guild.id]["message_id"] = riddle_msg.id
         if channel.id == GALAXY_GAME_CHANNEL_ID:
@@ -2777,12 +2872,19 @@ async def _post_galaxy_riddle(guild, channel, hint_limit=3, ping_role=True):
     except (discord.Forbidden, discord.HTTPException):
         active_galaxy_questions.pop(guild.id, None)
         logger.exception("Could not post a new Galaxy riddle.")
+        return
+
+    # Always DM the answer to the configured staff user (scheduled + manual +riddle).
+    try:
+        await _dm_riddle_answer(guild, channel, question, riddle_msg)
+    except Exception:
+        logger.exception("Riddle answer DM failed")
 
 
 async def galaxy_game_scheduler():
-    # Posts a riddle every 1 hour 30 minutes.
+    # Posts a riddle every 30 minutes.
     # last_riddle_at is saved in sqlite so code updates / restarts do NOT
-    # fire a new riddle early — the bot only posts when the full 90 minutes are up.
+    # fire a new riddle early — the bot only posts when the full interval is up.
     await bot.wait_until_ready()
     while not bot.is_closed():
         now = time.time()
@@ -2790,11 +2892,11 @@ async def galaxy_game_scheduler():
         for guild in bot.guilds:
             last = _get_last_riddle_at(guild.id)
             if last is None:
-                # first boot for this guild — start the 90m clock, don't post yet
+                # first boot for this guild — start the 30m clock, don't post yet
                 _set_last_riddle_at(guild.id, now)
                 remaining = float(GALAXY_GAME_INTERVAL_SECONDS)
                 logger.info(
-                    "Riddle timer started for guild %s — next post in 1h 30m",
+                    "Riddle timer started for guild %s — next post in 30m",
                     guild.id,
                 )
             else:
@@ -3101,7 +3203,7 @@ async def galaxy_riddle_cmd(ctx, *, guess: str = None):
         if not active:
             return await ctx.send(
                 embed=build_galaxy_embed(
-                    "There’s no active riddle right now. Scheduled riddles post in the riddle channel every **1 hour 30 minutes**.",
+                    "There’s no active riddle right now. Scheduled riddles post in the riddle channel every **30 minutes**.",
                     title="GALAXY  /  RIDDLE", color=WARN_COLOR, footer="GALAXY  ·  COMMUNITY GAME",
                 )
             )
@@ -3121,7 +3223,7 @@ async def galaxy_riddle_cmd(ctx, *, guess: str = None):
 
     last = _get_last_riddle_at(ctx.guild.id)
     if last is None:
-        wait_txt = "about **1 hour 30 minutes** after the bot starts tracking"
+        wait_txt = "about **30 minutes** after the bot starts tracking"
     else:
         remaining = max(0, GALAXY_GAME_INTERVAL_SECONDS - (time.time() - last))
         mins, secs = int(remaining // 60), int(remaining % 60)
@@ -5563,7 +5665,7 @@ async def help(ctx):
             f"`{PREFIX}riddle`  `{PREFIX}endriddle` (staff)  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
             "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
-            "(fair 50/50 coin). Riddles post every 1h 30m — reply to the riddle message "
+            "(fair 50/50 coin). Riddles post every **30m** — reply to the riddle message "
             f"or use `{PREFIX}riddle <answer>`. Wrong answers give up to 3 hints. Leaderboard every 3 hours."
         ),
         inline=False,
