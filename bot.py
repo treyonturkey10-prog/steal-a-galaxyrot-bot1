@@ -2913,7 +2913,9 @@ async def on_message(message):
         if time.time() > active_code["expires_at"]:
             active_codes.pop(key, None)
             continue
-        if message.channel.id != active_code["channel_id"]:
+        # Staff +code drops only count in the channel they were dropped in. The
+        # automatic drops count in ANY channel of the server.
+        if slot == "manual" and message.channel.id != active_code["channel_id"]:
             continue
         typed = message.content.strip().upper()
         if typed == active_code["code"]:
@@ -6142,7 +6144,8 @@ async def _award_code_claim(message, active):
                 f"This code was claimed by {message.author.mention}.",
                 title="GALAXY  /  CODE DROP (CLAIMED)", color=GALAXY_COLOR, footer="GALAXY  ·  CODE DROP",
             )
-            await message.channel.get_partial_message(active["message_id"]).edit(embed=closed)
+            drop_channel = message.guild.get_channel(active["channel_id"]) or message.channel
+            await drop_channel.get_partial_message(active["message_id"]).edit(embed=closed)
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             pass
     await send_mod_log(
