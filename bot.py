@@ -96,6 +96,7 @@ ROLE_IDS = {
     "assistant_head_manager": 1562142313105330247,
     "manager": 1564013035478188173,
     "staff_manager": 1549921109137424446,
+    "server_manager": 1575762674858328144,
     "assistant_staff_manager": 1568318227132579942,
     "head_admin": 1568318014955458651,
     "senior_admin": 1568319272554340352,
@@ -115,7 +116,7 @@ PERM_ROLE_IDS = {
     4: {ROLE_IDS["senior_admin"], ROLE_IDS["junior_admin"]},
     5: {
         ROLE_IDS["head_admin"], ROLE_IDS["assistant_staff_manager"],
-        ROLE_IDS["staff_manager"], ROLE_IDS["manager"],
+        ROLE_IDS["staff_manager"], ROLE_IDS["server_manager"], ROLE_IDS["manager"],
         ROLE_IDS["assistant_head_manager"], ROLE_IDS["head_manager"],
         ROLE_IDS["trial_director"], ROLE_IDS["head_director"],
         ROLE_IDS["senior_drc"], ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
@@ -207,6 +208,62 @@ def require_founder_or_coowner():
 
 # Staff strikes remain available to the higher staff group.
 STAFF_STRIKE_ROLE_IDS = set(PERM_ROLE_IDS[5]) | set(PERM_ROLE_IDS[6])
+
+# ---------------------------------------------------------------------------
+# +riddles / +riddle (starting a round): Assistant Staff Manager and above ONLY.
+# Discord "Administrator" permission, server ownership, and lower staff roles
+# (Head Admin and below) do NOT grant access.
+# ---------------------------------------------------------------------------
+RIDDLE_START_ROLE_IDS = {
+    ROLE_IDS["assistant_staff_manager"], ROLE_IDS["staff_manager"],
+    ROLE_IDS["server_manager"], ROLE_IDS["manager"],
+    ROLE_IDS["assistant_head_manager"], ROLE_IDS["head_manager"],
+    ROLE_IDS["trial_director"], ROLE_IDS["head_director"],
+    ROLE_IDS["senior_drc"], ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
+    ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"],
+}
+
+# ---------------------------------------------------------------------------
+# No-ping protection: these users cannot be pinged except by Director and above.
+# Discord "Administrator" permission does NOT bypass this.
+# ---------------------------------------------------------------------------
+PROTECTED_PING_USER_IDS = {
+    1464807318637121618,
+    1566616591267930112,
+    841710745897009212,
+    1244774065231761458,
+    1532561566271017009,
+    1400805489889120286,
+    1504581544042434731,
+}
+PING_BYPASS_ROLE_IDS = {
+    ROLE_IDS["trial_director"], ROLE_IDS["head_director"],
+    ROLE_IDS["senior_drc"], ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
+    ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"],
+}
+USER_MENTION_PATTERN = re.compile(r"<@!?(\d{15,22})>")
+
+
+def can_start_riddles(member):
+    """Assistant Staff Manager+ by role only (no Administrator-permission bypass)."""
+    return bool(member_role_ids(member) & RIDDLE_START_ROLE_IDS)
+
+
+def can_ping_protected_users(member):
+    """Director+ by role only. Protected users themselves may ping each other."""
+    if getattr(member, "id", None) in PROTECTED_PING_USER_IDS:
+        return True
+    return bool(member_role_ids(member) & PING_BYPASS_ROLE_IDS)
+
+
+def protected_users_pinged(message):
+    """IDs of protected users pinged by this message (direct mention or reply ping)."""
+    pinged = {u.id for u in message.mentions if u.id in PROTECTED_PING_USER_IDS}
+    for raw_id in USER_MENTION_PATTERN.findall(message.content or ""):
+        if int(raw_id) in PROTECTED_PING_USER_IDS:
+            pinged.add(int(raw_id))
+    return pinged
+
 
 # Special users supplied by the server owner.
 # This is a global user-ID registry. It does not automatically grant permissions;
@@ -1903,39 +1960,10 @@ def _prune_channel_map(store):
         store.pop(key, None)
 
 
-async def remember_deleted_message(message):
-    """Remember deleted human messages for +snipe (keeps a short history per channel).
-
-    If the deleted message was a reply, also remember which message it replied to.
-    """
+def remember_deleted_message(message):
+    """Remember deleted human messages for +snipe (keeps a short history per channel)."""
     if not message.guild or message.author.bot:
         return
-
-    reply_info = None
-    ref = message.reference
-    if ref is not None and ref.message_id:
-        replied = ref.resolved if isinstance(ref.resolved, discord.Message) else None
-        if replied is None:
-            replied = getattr(ref, "cached_message", None)
-        if replied is None:
-            try:
-                replied = await message.channel.fetch_message(ref.message_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                replied = None
-        ref_channel_id = ref.channel_id or message.channel.id
-        reply_info = {
-            "message_id": ref.message_id,
-            "jump_url": f"https://discord.com/channels/{message.guild.id}/{ref_channel_id}/{ref.message_id}",
-            "available": replied is not None,
-        }
-        if replied is not None:
-            reply_info.update({
-                "author_id": replied.author.id,
-                "author_name": str(replied.author),
-                "content": (replied.content or "").strip(),
-                "attachments": len(replied.attachments),
-            })
-
     entry = {
         "content": message.content or "",
         "author_name": str(message.author),
@@ -1946,7 +1974,6 @@ async def remember_deleted_message(message):
         "attachments": [attachment.url for attachment in message.attachments[:4]],
         "channel_id": message.channel.id,
         "message_id": message.id,
-        "reply_to": reply_info,
     }
     history = sniped_messages.setdefault(message.channel.id, [])
     # Avoid duplicate ids if Discord fires delete more than once
@@ -1988,9 +2015,7 @@ def build_snipe_embed(entry, index, total):
     content = (entry.get("content") or "").strip() or (
         "*No text content (the message may have contained an attachment or embed).*"
     )
-    # Keep mentions intact so they render like real pings (blue @name). Embeds never
-    # notify anyone, and the send uses AllowedMentions.none() as well.
-    safe_content = content
+    safe_content = discord.utils.escape_mentions(content)
     if len(safe_content) > 3500:
         safe_content = safe_content[:3497] + "..."
     # Show newest as page 1 when listing from newest-first for the user
@@ -2013,25 +2038,6 @@ def build_snipe_embed(entry, index, total):
             value=discord.utils.format_dt(entry["created_at"], style="R"),
             inline=True,
         )
-    reply = entry.get("reply_to")
-    if reply:
-        if reply.get("available"):
-            quoted = (reply.get("content") or "").strip()
-            if not quoted:
-                quoted = "*No text (attachment or embed).*" if reply.get("attachments") else "*Empty message.*"
-            if len(quoted) > 400:
-                quoted = quoted[:397] + "..."
-            quoted = "\n".join(f"> {line}" for line in quoted.splitlines()) or "> *Empty message.*"
-            reply_value = (
-                f"This was a reply to <@{reply.get('author_id')}> "
-                f"([jump to message]({reply.get('jump_url')})):\n{quoted}"
-            )
-        else:
-            reply_value = (
-                "This was a reply to a message that could no longer be loaded "
-                f"(it may have been deleted). [Jump]({reply.get('jump_url')})"
-            )
-        panel.add_field(name="Replying to", value=reply_value[:1024], inline=False)
     if entry.get("attachments"):
         panel.add_field(
             name="Attachments",
@@ -2047,8 +2053,8 @@ def build_snipe_embed(entry, index, total):
 def build_editsnipe_embed(entry, index, total):
     before = entry.get("before") or "*empty*"
     after = entry.get("after") or "*empty*"
-    safe_before = before
-    safe_after = after
+    safe_before = discord.utils.escape_mentions(before)
+    safe_after = discord.utils.escape_mentions(after)
     if len(safe_before) > 900:
         safe_before = safe_before[:897] + "..."
     if len(safe_after) > 900:
@@ -2867,6 +2873,27 @@ async def on_message(message):
 
     if message.author.bot:
         return
+    # No-ping protection: only Director+ may ping the protected users.
+    if not can_ping_protected_users(message.author):
+        if protected_users_pinged(message):
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                logger.warning("Could not delete protected-ping message %s", message.id)
+            panel = build_galaxy_embed(
+                f"› {message.author.mention} You can't ping this person. I'm very sorry.",
+                title="GALAXY  /  NO PING",
+                color=WARN_COLOR,
+                footer="GALAXY  ·  PING PROTECTION",
+            )
+            try:
+                await message.channel.send(
+                    embed=panel,
+                    allowed_mentions=discord.AllowedMentions(users=[message.author], roles=False, everyone=False),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Failed to send no-ping panel in %s", message.channel.id)
+            return
     # Never run content filtering against commands. This keeps command messages
     # (including +sanctions) from being intercepted by the chat-content filter.
     if not message.content.startswith(PREFIX):
@@ -2979,7 +3006,7 @@ async def on_message_delete(message):
     if message.id in cleared_message_ids:
         cleared_message_ids.discard(message.id)
         return
-    await remember_deleted_message(message)
+    remember_deleted_message(message)
 
 
 @bot.event
@@ -3628,12 +3655,12 @@ async def galaxy_daily(ctx):
     else:
         await ctx.send(embed=daily_embed)
 
-@bot.command(name="riddle")
+@bot.command(name="riddle", aliases=["riddles"])
 @commands.cooldown(1, 3, commands.BucketType.user)
 async def galaxy_riddle_cmd(ctx, *, guess: str = None):
     """Staff: +riddle [1-3] starts in this channel. Everyone: +riddle <answer> guesses."""
     active = active_galaxy_questions.get(ctx.guild.id)
-    is_staff_creator = has_staff_rank(ctx.author, 5) or ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+    is_staff_creator = can_start_riddles(ctx.author)
 
     # Staff can start a new round in the channel where they invoke this command.
     if is_staff_creator and (guess is None or guess.strip().isdigit()):
@@ -6121,7 +6148,7 @@ async def help(ctx):
             "**Perm 2 — Senior Moderator / Head Moderator:** Inherits Perm 1; `+del sanction` and coin balance adjustments.\n"
             "**Perm 3 — Admin:** Inherits Perm 1–2 and gets `+kick`.\n"
             "**Perm 4 — Senior Admin / Junior Admin:** Inherits Perm 1–3 and gets `+ban`.\n"
-            "**Perm 5 — Head Admin / Management / DRC / Dev / Axelle:** Inherits Perm 1–4; staff-strike tools.\n"
+            "**Perm 5 — Head Admin / Server Manager / Management / DRC / Dev / Axelle:** Inherits Perm 1–4; staff-strike tools.\n"
             "**Perm 6 — Main Founder / Founder / Co-Owner:** All permission levels, including `+bl` / `+blacklist`.\n\n"
             "Higher permission levels inherit lower-level access. Staff can moderate only "
             "members below their rank; equal- or higher-ranked staff are protected."
