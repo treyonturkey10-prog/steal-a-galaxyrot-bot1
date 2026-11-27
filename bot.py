@@ -2902,7 +2902,7 @@ async def on_message(message):
             except (discord.Forbidden, discord.HTTPException):
                 logger.exception("Failed to send no-ping panel in %s", message.channel.id)
             return
-    # Code drops: the first person to type the active code in its channel wins coins.
+    # Code drops: the first person to type the active code (in any channel) wins coins.
     # Staff +code drops and the bot's automatic drops live in separate slots, so
     # an automatic drop never cancels a staff drop (or the other way around).
     for slot in ("manual", "auto"):
@@ -2913,10 +2913,7 @@ async def on_message(message):
         if time.time() > active_code["expires_at"]:
             active_codes.pop(key, None)
             continue
-        # Staff +code drops only count in the channel they were dropped in. The
-        # automatic drops count in ANY channel of the server.
-        if slot == "manual" and message.channel.id != active_code["channel_id"]:
-            continue
+        # Codes count in ANY channel of the server, not just the one they were dropped in.
         typed = message.content.strip().upper()
         if typed == active_code["code"]:
             active_codes.pop(key, None)  # pop before any await: first person wins
@@ -6183,7 +6180,7 @@ async def _send_code_drop(channel, reward, starter_id, starter_label, always_pin
     guild = channel.guild
     code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
     panel = build_galaxy_embed(
-        f"First person to type this code in chat wins **{reward:,} Galaxy Coins**!\n\n"
+        f"First person to type this code in chat (any channel) wins **{reward:,} Galaxy Coins**!\n\n"
         f"# `{_anti_paste_code(code)}`\n\n"
         f"You have to **type it out** — copy and paste won't work.\n"
         f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
