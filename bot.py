@@ -168,10 +168,11 @@ def has_staff_rank(member, minimum_rank):
 
 def require_staff_rank(minimum_rank):
     async def predicate(ctx):
-        # Server owners and Discord administrators are never blocked by the
-        # configured role ladder; all other staff must meet the exact rank.
+        # Special users, server owners, and Discord administrators bypass the
+        # role ladder. Everyone else must meet the exact rank.
         return (
-            ctx.author.id == ctx.guild.owner_id
+            ctx.author.id in SPECIAL_USERS
+            or ctx.author.id == ctx.guild.owner_id
             or ctx.author.guild_permissions.administrator
             or has_staff_rank(ctx.author, minimum_rank)
         )
@@ -1746,12 +1747,15 @@ async def filter_bad_content(message):
 
 
 def is_staff_member(member):
-    """Return True for configured staff, the server owner, or administrators."""
+    """Return True for configured staff, special users, the server owner, or administrators."""
     return bool(
         member
         and (
-            getattr(member, "guild_permissions", None)
-            and member.guild_permissions.administrator
+            getattr(member, "id", None) in SPECIAL_USERS
+            or (
+                getattr(member, "guild_permissions", None)
+                and member.guild_permissions.administrator
+            )
             or getattr(member, "id", None) == getattr(getattr(member, "guild", None), "owner_id", None)
             or has_any_role(member, PERM1_ROLE_IDS)
         )
@@ -1793,8 +1797,12 @@ def is_giveaway_announcement(message):
 
 
 # ---------------------------------------------------------------------------
-# DM chat — casual human-style replies when someone messages the bot privately.
+# DM chat — short-term memory + context replies so it feels like a real person.
 # ---------------------------------------------------------------------------
+_dm_memory = {}  # user_id -> {"history": [(role, text), ...], "last_at": float}
+_DM_MEMORY_TTL = 20 * 60  # keep context for 20 minutes
+_DM_MEMORY_MAX = 8
+
 _DM_GREETING_WORDS = {
     "yo", "yoo", "yooo", "yoooo", "yooooo", "hey", "heyy", "heyyy", "hi", "hii", "hiii",
     "hello", "helloo", "hiya", "sup", "wsp", "wsg", "wyd", "wassup", "whatsup",
@@ -1806,113 +1814,250 @@ _DM_BYE_WORDS = {"bye", "cya", "goodbye", "later", "gtg", "gnight", "goodnight",
 
 def _normalize_dm_text(text: str) -> str:
     text = (text or "").casefold().strip()
-    # drop bot mentions
     text = re.sub(r"<@!?\d+>", " ", text)
-    # strip leftover punctuation noise at ends
     text = re.sub(r"[!?.~,]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+def _dm_get_memory(user_id: int):
+    now = time.time()
+    mem = _dm_memory.get(user_id)
+    if not mem or now - mem.get("last_at", 0) > _DM_MEMORY_TTL:
+        mem = {"history": [], "last_at": now}
+        _dm_memory[user_id] = mem
+    mem["last_at"] = now
+    return mem
+
+
+def _dm_push(user_id: int, role: str, text: str):
+    mem = _dm_get_memory(user_id)
+    mem["history"].append((role, text[:200]))
+    if len(mem["history"]) > _DM_MEMORY_MAX:
+        mem["history"] = mem["history"][-_DM_MEMORY_MAX:]
+
+
+def _dm_pick(options):
+    return random.choice(options)
+
+
+def _dm_craft_reply(content: str, low: str, tokens: list, history: list) -> str:
+    """Build a reply that reacts to what they actually said."""
+    first = tokens[0] if tokens else ""
+    joined = " ".join(tokens)
+    prev_user = next((t for role, t in reversed(history) if role == "user"), "")
+    prev_bot = next((t for role, t in reversed(history) if role == "bot"), "")
+
+    # --- greetings ---
+    if low in _DM_GREETING_WORDS or first in _DM_GREETING_WORDS or low.startswith(
+        ("yo ", "hey ", "hi ", "hello ", "sup ", "wsp ", "wsg ", "ayo ", "wyd ")
+    ):
+        # If we already greeted recently, don't restart the same loop
+        if prev_bot and any(g in prev_bot.casefold() for g in ("yo", "hey", "sup", "wsp", "what’s good", "whats good")):
+            return _dm_pick([
+                "yoo you good?",
+                "what’s good with you",
+                "you need something or just vibing",
+                "i’m here, talk to me",
+                "sup, what’s on your mind",
+            ])
+        return _dm_pick([
+            "yo what’s good",
+            "yoo",
+            "hey, what’s up",
+            "sup",
+            "wsp",
+            "yo, how you been",
+            "hey hey",
+        ])
+
+    # --- how have you been / how are you ---
+    if any(p in low for p in (
+        "how have you been", "how you been", "how u been", "how are you", "how r u",
+        "how are u", "hru", "how you doing", "you good", "you aight", "hows it going",
+        "how's it going", "how you holding up",
+    )):
+        return _dm_pick([
+            "i been solid, just handling server stuff. you though?",
+            "pretty good ngl, been busy. how you been?",
+            "i’m alright — quiet night on my end. you good?",
+            "can’t complain. what’s been up with you",
+            "been chillin honestly. you good?",
+        ])
+
+    # --- wyd / what you doing ---
+    if first in {"wyd", "wydrn", "wubu", "wya"} or low in {"what you doing", "what are you doing", "what u doing", "what you up to", "what u up to"}:
+        return _dm_pick([
+            "just here, watching the server. you?",
+            "not much, on standby. wyd",
+            "chillin in the background. you bored or what",
+            "same old — making sure nobody’s crashing out. you?",
+        ])
+
+    # --- "nothing" / "nm" after we asked what's up ---
+    if low in {"nothing", "nth", "nm", "not much", "nun", "nun much", "nth much", "idk", "idk tbh", "bored"}:
+        return _dm_pick([
+            "fair. i’m just here if you need anything",
+            "valid. quiet nights hit different",
+            "bet. i’m around if something comes up",
+            "i feel that. you good though?",
+            "real. wanna rant or you just vibing",
+        ])
+
+    # --- short casual affirmations ---
+    if low in {"ok", "okay", "k", "kk", "alr", "alright", "bet", "fs", "fr", "ong", "yea", "yeah", "yep", "ye", "nah", "no", "yes", "ig", "lol", "lmao", "haha", "ha", "true", "real", "facts", "ong"}:
+        return _dm_pick([
+            "bet",
+            "fs",
+            "alr",
+            "cool cool",
+            "gotchu",
+            "fr",
+            "yup",
+            "aight",
+        ])
+
+    # --- "son" / slang address ---
+    if low in {"son", "bro", "bruh", "nigga", "nigga what", "my boy", "g", "gang"}:
+        return _dm_pick([
+            "yoo what’s up",
+            "talk to me",
+            "go on",
+            "i’m listening",
+            "wsp",
+        ])
+
+    # --- feelings / status ---
+    if any(w in tokens for w in ("tired", "exhausted", "sleepy", "drained")):
+        return _dm_pick([
+            "get some rest then, server ain’t going nowhere",
+            "go sleep fr, you earned it",
+            "tired is valid. hydrate and log off a bit",
+        ])
+    if any(w in tokens for w in ("sad", "down", "depressed", "upset", "mad", "angry", "pissed")):
+        return _dm_pick([
+            "damn, what happened",
+            "that’s rough. you wanna talk about it?",
+            "i’m here if you need to vent",
+            "take a breath. what went down",
+        ])
+    if any(w in tokens for w in ("happy", "hype", "excited", "lit", "fire")):
+        return _dm_pick([
+            "that’s what i like to hear",
+            "ayy keep that energy",
+            "bet, love that for you",
+            "let’s gooo",
+        ])
+    if any(w in tokens for w in ("bored", "boring")):
+        return _dm_pick([
+            "go touch the riddle channel or gamble some coins 😭",
+            "bored? go bother people in the server (nicely)",
+            "same tbh. quiet night",
+        ])
+
+    # --- thanks / bye ---
+    if first in _DM_THANKS_WORDS or any(w in tokens for w in _DM_THANKS_WORDS):
+        return _dm_pick(["np", "you got it", "ofc", "anytime", "fs", "don’t even worry about it"])
+    if first in _DM_BYE_WORDS or any(w in tokens for w in _DM_BYE_WORDS):
+        return _dm_pick(["cya", "later", "peace", "see ya", "aight, take care", "bye bye"])
+
+    # --- help / identity ---
+    if "help" in low or "command" in low or "prefix" in low:
+        return _dm_pick([
+            f"prefix is `{PREFIX}` — hit `{PREFIX}help` and you’ll see everything",
+            f"commands live under `{PREFIX}help` if you need the list",
+            f"try `{PREFIX}help` real quick",
+        ])
+    if low in {"who are you", "what are you", "what do you do", "who r u", "who ru"}:
+        return _dm_pick([
+            "i run moderation + coins + riddles for the server. in dms i’m just chatting",
+            "galaxy bot — staff tools mostly. but i can talk out here too",
+            f"mod bot for the server. `{PREFIX}help` if you want the command list",
+        ])
+
+    # --- questions ---
+    if "?" in content:
+        if any(w in low for w in ("ban", "kick", "mute", "timeout", "warn", "strike")):
+            return _dm_pick([
+                "yeah that stuff’s in the server with the right staff perms",
+                f"mod commands only work in the server — `{PREFIX}help` shows what you can run",
+                "do that in the server, not in dms",
+            ])
+        if any(w in low for w in ("coin", "daily", "balance", "gamble", "riddle")):
+            return _dm_pick([
+                f"coins / daily / riddles are all in the server. `{PREFIX}daily` `{PREFIX}bal` `{PREFIX}riddle`",
+                "yeah economy is in-server. go claim daily if you haven’t",
+            ])
+        return _dm_pick([
+            "honestly not sure — staff in the server might know better",
+            "good question. i don’t have a perfect answer on that one",
+            "couldn’t tell you for sure. what made you ask",
+            "idk fr. you thinking about something specific?",
+        ])
+
+    # --- follow-up if they keep the convo going ---
+    if len(history) >= 2:
+        return _dm_pick([
+            "yeah i hear you",
+            "makes sense",
+            "okay okay i got you",
+            "then what happened",
+            "keep going",
+            "and then?",
+            "real",
+            "damn okay",
+            "i feel you",
+            "say more",
+            "aight so what’s next",
+        ])
+
+    # --- default: acknowledge, invite more ---
+    return _dm_pick([
+        "yo i hear you — what’s going on",
+        "aight, talk to me",
+        "what’s on your mind",
+        "i’m listening",
+        "go on",
+        "bet, tell me more",
+        "wsp, you good?",
+        "say less… actually say more",
+    ])
+
+
 async def handle_dm_chat(message):
-    """Reply in DMs with natural, short human-style messages."""
+    """Reply in DMs like a real person — short, contextual, with light memory."""
     try:
         if message.author.bot:
             return
 
         content = (message.content or "").strip()
         if not content:
-            # stickers / embeds only
             try:
-                await message.channel.send(random.choice(["yo", "what’s that", "haha", "bet"]))
+                await message.channel.send(_dm_pick(["yo", "what’s that", "haha"]))
             except Exception:
-                logger.exception("DM empty-content reply failed for %s", message.author.id)
+                logger.exception("DM empty reply failed for %s", message.author.id)
             return
 
-        # Commands still work in DMs
         if content.startswith(PREFIX):
             await bot.process_commands(message)
             return
 
         low = _normalize_dm_text(content)
         tokens = low.split()
-        first = tokens[0] if tokens else ""
+        mem = _dm_get_memory(message.author.id)
+        _dm_push(message.author.id, "user", content)
 
-        reply = None
+        reply = _dm_craft_reply(content, low, tokens, mem["history"])
+        _dm_push(message.author.id, "bot", reply)
 
-        # Greetings: exact, or starts with a greeting word ("yo wsp", "hey man", …)
-        if low in _DM_GREETING_WORDS or first in _DM_GREETING_WORDS or low.startswith(
-            ("yo ", "hey ", "hi ", "hello ", "sup ", "wsp ", "wsg ", "ayo ")
-        ):
-            reply = random.choice([
-                "yo",
-                "yoo",
-                "yo what’s good",
-                "hey",
-                "heyy",
-                "sup",
-                "wsp",
-                "hey what’s up",
-                "yo what you need",
-                "yoo what’s goin on",
-            ])
-        elif first in _DM_THANKS_WORDS or any(w in tokens for w in _DM_THANKS_WORDS):
-            reply = random.choice(["np", "you got it", "ofc", "anytime", "no problem", "yessir", "fs"])
-        elif first in _DM_BYE_WORDS or any(w in tokens for w in _DM_BYE_WORDS):
-            reply = random.choice(["cya", "later", "bye", "see ya", "aight peace", "take care"])
-        elif any(p in low for p in (
-            "how are you", "how r u", "how are u", "hru", "how you doing",
-            "you good", "you aight", "hows it going", "how's it going",
-        )):
-            reply = random.choice([
-                "i’m good, just running the server — you?",
-                "chillin, you good?",
-                "pretty solid, what’s up with you",
-                "doing alright, you?",
-            ])
-        elif low in {"ok", "okay", "k", "kk", "alr", "alright", "bet", "fs", "fr", "ong", "yea", "yeah", "yep", "ye", "nah", "no", "yes", "ig", "idk", "lmao", "lol", "haha"}:
-            reply = random.choice(["bet", "alr", "fs", "aight", "cool", "gotchu", "lol", "fr"])
-        elif "help" in low or "command" in low or "prefix" in low:
-            reply = random.choice([
-                f"prefix is `{PREFIX}` — type `{PREFIX}help` and i’ll show you the list",
-                f"need commands? `{PREFIX}help` has everything",
-                f"try `{PREFIX}help` real quick",
-            ])
-        elif low in {"who are you", "what are you", "what do you do", "who r u", "who ru"}:
-            reply = random.choice([
-                "i’m the galaxy mod bot — staff tools, coins, riddles, the usual",
-                f"galaxy systems bot. `{PREFIX}help` if you wanna see what i run",
-                "mod + community bot for the server. dms are just for chat + a few commands",
-            ])
-        elif "?" in content:
-            reply = random.choice([
-                f"not sure i got a perfect answer in dms — try `{PREFIX}help` or ask staff in the server",
-                "hmm not sure. staff in the server might know better",
-                f"couldn’t tell you for sure. `{PREFIX}help` has the command list if that helps",
-            ])
-        else:
-            reply = random.choice([
-                "yo i caught that — what’s up",
-                "what’s good",
-                "say less, what’s going on",
-                "i’m listening",
-                "yoo",
-                "haha aight",
-                "real",
-                "bet, tell me more",
-                f"i mostly handle the server, but i’m here. need `{PREFIX}help`?",
-                "mhm",
-                "go on",
-                "wsp",
-            ])
-
-        # Human-ish pause, then send (typing is optional — never block the reply)
-        await asyncio.sleep(random.uniform(0.35, 1.0))
+        # Typing delay scales a bit with reply length so it feels human
+        delay = min(2.2, 0.4 + len(reply) * 0.03) + random.uniform(0.15, 0.55)
+        await asyncio.sleep(delay * 0.45)
         try:
             async with message.channel.typing():
-                await asyncio.sleep(random.uniform(0.25, 0.7))
+                await asyncio.sleep(delay * 0.55)
         except Exception:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
 
         await message.channel.send(reply)
         logger.info("DM reply to %s (%s): %r -> %r", message.author, message.author.id, content[:80], reply)
@@ -2943,21 +3088,25 @@ def require_staff_strike_access():
 
 
 def can_moderate_target(ctx, member):
-    """Respect both the configured staff ladder and Discord role hierarchy."""
+    """Respect staff ladder + Discord hierarchy. Special users bypass both."""
+    # Special users / server owner can run mod commands on anyone, including themselves.
+    if ctx.author.id in SPECIAL_USERS or ctx.author.id == ctx.guild.owner_id:
+        return True
     if member.id == ctx.author.id:
         return False
-    if ctx.author.id == ctx.guild.owner_id:
-        return True
+    if ctx.author.guild_permissions.administrator and member.id != ctx.guild.owner_id:
+        # Admins still can't act on equal/higher Discord roles or equal+ staff ranks
+        pass
 
-    # Never allow a moderator (including a special-user command bypass) to act
-    # on someone whose Discord highest role is equal to or above theirs.
+    # Never allow a moderator to act on someone whose Discord highest role is
+    # equal to or above theirs.
     if member.top_role >= ctx.author.top_role:
         return False
 
     actor_rank = effective_staff_rank(ctx.author)
     target_rank = effective_staff_rank(member)
     # Staff ranks provide an additional safeguard even if the role ordering
-    # happens to be misconfigured; equal/higher staff remain protected.
+    # happens to be misconfigured; equal- and higher-ranked staff remain protected.
     if target_rank:
         return actor_rank > target_rank
     return True
@@ -5143,4 +5292,3 @@ if not TOKEN:
     raise SystemExit("Galaxy Bot cannot start: DISCORD_TOKEN is missing. Add DISCORD_TOKEN=your_bot_token to the host environment or .env file, then restart.")
 
 bot.run(TOKEN)
-
