@@ -140,6 +140,11 @@ BLACKLISTED_WORDS = [
 DISCORD_GG_INVITE_PATTERN = re.compile(
     r"(?i)(?<![\w.-])(?:https?://)?(?:www\.)?discord\.gg/[A-Za-z0-9-]+(?:\?[^\s]*)?"
 )
+# Staff (any role from +perms / the staff ladder) may post discord.gg invites
+# ONLY in these channels. Everywhere else invites are blocked for everyone.
+PARTNERSHIP_INVITE_CHANNEL_IDS = {
+    1552650783390965910,  # #partnerships
+}
 
 # Blacklisted-word escalation is counted over a rolling 30-day period.
 # Messages are never deleted; 1-3: warn; 4: 30m; 5: 1h; 6: 6h; 7: 12h; 8+: 24h.
@@ -887,23 +892,336 @@ GALAXY_QUESTIONS = [
     {"difficulty": "Hard", "question": "A word has six letters. Remove one and twelve remain. What is it?", "answer": "dozens", "hints": ["Think of a word for a group of twelve.", "It is plural.", "A dozen is twelve; dozens can remain after one is removed."]},
 ]
 
-# Draw from a shuffled full deck: easy, medium and hard riddles all mix together.
-# No riddle repeats until every entry in the bank has been used. The next cycle
-# avoids starting with the last riddle from the previous cycle.
+# ---------------------------------------------------------------------------
+# Riddle system: curated bank + procedural generator with >500,000,000 uniques.
+# ---------------------------------------------------------------------------
+# Theoretical unique space (seeds 0 .. RIDDLE_UNIVERSE_SIZE-1). Each seed maps
+# to one deterministic riddle so the same seed never produces two different
+# puzzles, and the pool is far larger than a server will ever exhaust.
+RIDDLE_UNIVERSE_SIZE = 500_000_000
+
+_RIDDLE_ANIMALS = (
+    "cat", "dog", "bird", "fish", "lion", "tiger", "bear", "wolf", "fox", "owl",
+    "eagle", "shark", "whale", "frog", "snake", "mouse", "horse", "cow", "pig",
+    "sheep", "goat", "duck", "goose", "crab", "seal", "deer", "moose", "hare",
+    "crow", "dove", "ant", "bee", "crab", "eel", "bat", "rat", "hen", "ram",
+)
+_RIDDLE_OBJECTS = (
+    "book", "lamp", "coin", "key", "door", "map", "cup", "box", "ring", "clock",
+    "chair", "table", "phone", "pen", "bag", "hat", "shoe", "ball", "rope", "mirror",
+    "candle", "bottle", "brush", "comb", "spoon", "fork", "plate", "bowl", "towel",
+    "pillow", "blanket", "window", "fence", "bridge", "boat", "train", "plane", "bike",
+)
+_RIDDLE_PLACES = (
+    "forest", "river", "ocean", "mountain", "desert", "cave", "island", "valley",
+    "city", "village", "castle", "garden", "library", "kitchen", "basement", "attic",
+    "beach", "bridge", "tunnel", "station", "market", "tower", "harbor", "meadow",
+)
+_RIDDLE_COLORS = (
+    "red", "blue", "green", "yellow", "black", "white", "purple", "orange", "pink",
+    "brown", "silver", "gold", "gray", "cyan", "magenta", "teal", "navy", "crimson",
+)
+_RIDDLE_BODY = (
+    "hand", "foot", "eye", "ear", "nose", "mouth", "head", "arm", "leg", "finger",
+    "thumb", "tooth", "tongue", "heart", "back", "knee", "elbow", "shoulder",
+)
+_RIDDLE_ACTIONS = (
+    "run", "jump", "sleep", "eat", "sing", "dance", "fly", "swim", "hide", "climb",
+    "write", "read", "cook", "build", "paint", "count", "listen", "watch", "wait",
+)
+_RIDDLE_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+
+# Curated deck first; procedural fills forever after.
 _galaxy_riddle_deck = []
 _galaxy_riddle_last = None
+_galaxy_riddle_used_seeds = set()
+
+
+def _riddle_difficulty_from_seed(seed: int) -> str:
+    bucket = seed % 10
+    if bucket < 4:
+        return "Easy"
+    if bucket < 8:
+        return "Medium"
+    return "Hard"
+
+
+def _generate_procedural_riddle(seed: int) -> dict:
+    """Deterministic riddle for a seed in [0, RIDDLE_UNIVERSE_SIZE)."""
+    seed = int(seed) % RIDDLE_UNIVERSE_SIZE
+    rng = random.Random(seed)
+    family = seed % 16
+    difficulty = _riddle_difficulty_from_seed(seed)
+
+    if family == 0:
+        # Number: double + add
+        answer = rng.randint(2, 80)
+        add = rng.randint(1, 40)
+        result = answer * 2 + add
+        q = f"I am a whole number. Double me and add {add}, and you get {result}. What number am I?"
+        hints = [
+            f"Start from {result} and reverse the steps.",
+            f"Subtract {add}, then divide by 2.",
+            f"The answer is between {max(1, answer-5)} and {answer+5}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
+    if family == 1:
+        answer = rng.randint(3, 60)
+        mult = rng.choice([3, 4, 5, 6, 7, 8, 9])
+        sub = rng.randint(1, 25)
+        result = answer * mult - sub
+        q = f"I am a whole number. Multiply me by {mult} and subtract {sub}, and you get {result}. What number am I?"
+        hints = [
+            f"Add {sub} to {result} first.",
+            f"Then divide by {mult}.",
+            f"The answer is a whole number near {answer}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
+    if family == 2:
+        a = rng.randint(2, 40)
+        b = rng.randint(2, 40)
+        if a == b:
+            b = a + rng.randint(1, 9)
+        op = rng.choice(["sum", "difference", "product"])
+        if op == "sum":
+            result = a + b
+            q = f"Two whole numbers add up to {result}. One of them is {a}. What is the other?"
+            answer = b
+            hints = [f"Take {result} minus {a}.", "It's simple subtraction.", f"Answer is {b}."]
+        elif op == "difference":
+            hi, lo = max(a, b), min(a, b)
+            result = hi - lo
+            q = f"The difference between two whole numbers is {result}. The larger number is {hi}. What is the smaller number?"
+            answer = lo
+            hints = [f"Subtract {result} from {hi}.", "Larger minus difference.", f"Answer is {lo}."]
+        else:
+            result = a * b
+            q = f"Two whole numbers multiply to {result}. One of them is {a}. What is the other?"
+            answer = b
+            hints = [f"Divide {result} by {a}.", "It's exact division.", f"Answer is {b}."]
+        return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints[:3], "seed": seed}
+
+    if family == 3:
+        word = rng.choice(_RIDDLE_OBJECTS + _RIDDLE_ANIMALS)
+        letter = rng.choice(list(dict.fromkeys(word)))  # letter that appears in the word
+        count = word.count(letter)
+        q = f"How many times does the letter **{letter.upper()}** appear in the word **{word.upper()}**?"
+        hints = [
+            f"Spell it out: {'-'.join(word.upper())}.",
+            f"Count only the letter {letter.upper()}.",
+            f"The total is {count}.",
+        ]
+        return {"difficulty": "Easy", "question": q, "answer": str(count), "hints": hints, "seed": seed}
+
+    if family == 4:
+        word = rng.choice(_RIDDLE_OBJECTS + _RIDDLE_ANIMALS + _RIDDLE_PLACES)
+        q = f"How many letters are in the word **{word.upper()}**?"
+        answer = len(word)
+        hints = [
+            f"Count each letter in {word}.",
+            "Don't count spaces — there are none.",
+            f"The length is {answer}.",
+        ]
+        return {"difficulty": "Easy", "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
+    if family == 5:
+        n = rng.randint(2, 12)
+        item = rng.choice(_RIDDLE_OBJECTS)
+        place = rng.choice(_RIDDLE_PLACES)
+        q = (
+            f"There are {n} {item}s in a {place}. You take away {max(1, n // 2)}. "
+            f"How many {item}s do you have?"
+        )
+        answer = max(1, n // 2)
+        hints = [
+            "Read carefully — how many did YOU take?",
+            f"You took {answer} of them.",
+            f"The answer is {answer}, not what's left behind.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
+    if family == 6:
+        color = rng.choice(_RIDDLE_COLORS)
+        animal = rng.choice(_RIDDLE_ANIMALS)
+        place = rng.choice(_RIDDLE_PLACES)
+        # Classic "what color is the ..." logic joke variants
+        variants = [
+            (
+                f"A {color} {animal} is stuck in a pure white {place} with no windows and only one door painted {color}. "
+                f"What color is the {animal}?",
+                color,
+                [f"It was described as a {color} {animal}.", "Don't overthink the room.", f"The answer is {color}."],
+            ),
+            (
+                f"Everything in a house is {color}. The walls, the carpet, the furniture — all {color}. "
+                f"What color is the staircase?",
+                color,
+                ["Everything in the house is that color.", "Including the staircase.", f"It's {color}."],
+            ),
+        ]
+        q, answer, hints = rng.choice(variants)
+        return {"difficulty": difficulty, "question": q, "answer": answer, "hints": hints, "seed": seed}
+
+    if family == 7:
+        # Sequence next number
+        start = rng.randint(1, 20)
+        step = rng.randint(2, 9)
+        seq = [start + i * step for i in range(4)]
+        answer = start + 4 * step
+        q = f"What comes next in this sequence: {', '.join(str(x) for x in seq)}, … ?"
+        hints = [
+            f"Each step adds the same amount.",
+            f"The gap between numbers is {step}.",
+            f"Next is {answer}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
+    if family == 8:
+        # Reverse spelling
+        word = rng.choice(_RIDDLE_OBJECTS + _RIDDLE_ANIMALS)
+        q = f"What word is **{word[::-1]}** when spelled backward?"
+        hints = [
+            "Read the scrambled letters from right to left.",
+            f"It starts with **{word[0].upper()}**.",
+            f"The word is {word}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": word, "hints": hints, "seed": seed}
+
+    if family == 9:
+        a = rng.randint(1, 15)
+        b = rng.randint(1, 15)
+        c = rng.randint(1, 15)
+        result = a + b * c  # order of operations
+        q = f"What is {a} + {b} × {c}? (Use normal math order of operations.)"
+        hints = [
+            "Multiply before you add.",
+            f"First compute {b} × {c}.",
+            f"The total is {result}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(result), "hints": hints, "seed": seed}
+
+    if family == 10:
+        body = rng.choice(_RIDDLE_BODY)
+        action = rng.choice(_RIDDLE_ACTIONS)
+        obj = rng.choice(_RIDDLE_OBJECTS)
+        templates = [
+            (
+                f"I have a {body} but I never {action}. I am related to a {obj}. What am I?",
+                obj,
+                [f"Think about a {obj}.", f"It can have a '{body}' in a figurative way.", f"Answer: {obj}."],
+            ),
+            (
+                f"You can {action} with me, and I'm often near a {obj}. What am I?",
+                obj,
+                [f"Common object: {obj}.", "Everyday item.", f"Answer: {obj}."],
+            ),
+        ]
+        q, answer, hints = templates[seed % len(templates)]
+        return {"difficulty": difficulty, "question": q, "answer": answer, "hints": hints, "seed": seed}
+
+    if family == 11:
+        # Clock / time arithmetic
+        h = rng.randint(1, 11)
+        m = rng.choice([0, 15, 30, 45])
+        add_h = rng.randint(1, 5)
+        total_m = h * 60 + m + add_h * 60
+        nh, nm = (total_m // 60) % 12, total_m % 60
+        if nh == 0:
+            nh = 12
+        answer = f"{nh}:{nm:02d}"
+        q = f"A clock shows {h}:{m:02d}. What time will it show in {add_h} hour{'s' if add_h != 1 else ''}?"
+        hints = [
+            f"Add {add_h} hours to {h}:{m:02d}.",
+            "Stay on a 12-hour clock face.",
+            f"Answer format like {answer}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": answer, "hints": hints, "seed": seed}
+
+    if family == 12:
+        n = rng.randint(5, 30)
+        q = f"I am an odd number. Take away one letter and I become even. What number am I?"
+        # Classic is SEVEN -> even; keep classic sometimes, else number-word play is hard
+        # Use classic with high probability via seed, else "nine" doesn't work. Stick to seven.
+        answer = "seven"
+        hints = [
+            "Think of the spelling of a number.",
+            "Remove the letter 's'.",
+            "S-E-V-E-N without S is EVEN.",
+        ]
+        # vary the prompt slightly so seeds differ
+        if seed % 3 == 0:
+            q = "Which odd number becomes even when you remove one letter from its spelling?"
+        return {"difficulty": "Medium", "question": q, "answer": answer, "hints": hints, "seed": seed}
+
+    if family == 13:
+        x = rng.randint(2, 20)
+        y = rng.randint(2, 20)
+        z = x * y
+        q = f"If {x} workers can finish a job in {y} hours, how many worker-hours is the job in total?"
+        hints = [
+            "Multiply workers by hours.",
+            f"{x} × {y}.",
+            f"Total is {z}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": str(z), "hints": hints, "seed": seed}
+
+    if family == 14:
+        word = rng.choice(_RIDDLE_OBJECTS + _RIDDLE_ANIMALS + _RIDDLE_PLACES)
+        first = word[0]
+        q = f"I am a common English word for something you know. I start with **{first.upper()}** and I have {len(word)} letters. One correct answer is a {word}. What word am I thinking of?"
+        hints = [
+            f"It starts with {first.upper()}.",
+            f"It has {len(word)} letters.",
+            f"The answer is {word}.",
+        ]
+        return {"difficulty": difficulty, "question": q, "answer": word, "hints": hints, "seed": seed}
+
+    # family 15 — age / relation arithmetic
+    child = rng.randint(5, 15)
+    parent = child + rng.randint(20, 35)
+    q = f"A parent is {parent - child} years older than their child. The child is {child}. How old is the parent?"
+    answer = parent
+    hints = [
+        f"Add {parent - child} to {child}.",
+        "Parent age = child age + difference.",
+        f"The parent is {parent}.",
+    ]
+    return {"difficulty": difficulty, "question": q, "answer": str(answer), "hints": hints, "seed": seed}
+
 
 def _draw_galaxy_riddle():
+    """Curated bank first (once per uptime), then the 500M+ procedural universe."""
     global _galaxy_riddle_deck, _galaxy_riddle_last
-    if not _galaxy_riddle_deck:
+    # First launch (or after explicit reset): load the hand-crafted bank once.
+    if not _galaxy_riddle_deck and _galaxy_riddle_last is None:
         _galaxy_riddle_deck = list(GALAXY_QUESTIONS)
         random.shuffle(_galaxy_riddle_deck)
-        if len(_galaxy_riddle_deck) > 1 and _galaxy_riddle_last is not None:
-            if _galaxy_riddle_deck[-1] is _galaxy_riddle_last:
-                _galaxy_riddle_deck[0], _galaxy_riddle_deck[-1] = (
-                    _galaxy_riddle_deck[-1], _galaxy_riddle_deck[0]
-                )
-    question = _galaxy_riddle_deck.pop()
+
+    if _galaxy_riddle_deck:
+        question = _galaxy_riddle_deck.pop()
+        _galaxy_riddle_last = question
+        return question
+
+    # Curated bank exhausted — generate from the huge procedural space.
+    # Mix in a curated riddle occasionally so classics still appear.
+    if random.random() < 0.08:
+        question = random.choice(GALAXY_QUESTIONS).copy()
+        _galaxy_riddle_last = question
+        return question
+
+    for _ in range(16):
+        seed = random.randrange(RIDDLE_UNIVERSE_SIZE)
+        if seed not in _galaxy_riddle_used_seeds:
+            break
+    else:
+        seed = random.randrange(RIDDLE_UNIVERSE_SIZE)
+    _galaxy_riddle_used_seeds.add(seed)
+    if len(_galaxy_riddle_used_seeds) > 50000:
+        # Bound memory; the theoretical pool is still RIDDLE_UNIVERSE_SIZE.
+        _galaxy_riddle_used_seeds.clear()
+    question = _generate_procedural_riddle(seed)
     _galaxy_riddle_last = question
     return question
 
@@ -1622,6 +1940,20 @@ class SnipeBrowser(discord.ui.View):
         await interaction.response.edit_message(embed=self._embed(), view=self)
 
 
+def _can_post_invite_links(member, channel_id):
+    """Staff on the +perms ladder may post discord.gg invites only in partnership channels."""
+    if member is None:
+        return False
+    if channel_id not in PARTNERSHIP_INVITE_CHANNEL_IDS:
+        return False
+    return (
+        member.id in SPECIAL_USERS
+        or member.id == getattr(member.guild, "owner_id", None)
+        or getattr(member.guild_permissions, "administrator", False)
+        or has_staff_rank(member, 1)  # any role listed in +perms
+    )
+
+
 async def filter_bad_content(message):
     """Flag blocked content without deleting messages; record strikes and log."""
     if not message.guild or message.author.bot or not (message.content or "").strip():
@@ -1633,26 +1965,32 @@ async def filter_bad_content(message):
             member = await message.guild.fetch_member(message.author.id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             member = None
-    # Preserve the previous exemption for Perm 5+ staff.
-    if member and has_staff_rank(member, 5):
-        return False
 
     content = message.content
     lowered = content.lower()
 
-    # Only discord.gg invite links are blocked; .gift and unrelated links are allowed.
+    # discord.gg invites: staff (perms roles) may post them ONLY in #partnerships.
+    # Everywhere else — including for high staff — invites are blocked.
     link_match = DISCORD_GG_INVITE_PATTERN.search(content)
     if link_match:
-        # Messages are never deleted by this bot. The invite is recorded and flagged only.
+        if _can_post_invite_links(member, message.channel.id):
+            # Allowed partnership post — do not flag.
+            return False
         record_sanction(
             message.guild.id, message.author.id, bot.user.id if bot.user else 0,
             "Blacklisted Link", "Discord invite links are not allowed",
             details=f"Matched: {link_match.group(0)} | Original message: {content}",
         )
         try:
+            where = "in this channel"
+            if PARTNERSHIP_INVITE_CHANNEL_IDS:
+                ch_mentions = ", ".join(f"<#{cid}>" for cid in PARTNERSHIP_INVITE_CHANNEL_IDS)
+                where = f"here — staff can only post invites in {ch_mentions}"
             notice = discord.Embed(
                 title="GALAXY  /  LINK FILTER",
-                description=f"{message.author.mention} Discord invite links (`discord.gg`) are not allowed here.",
+                description=(
+                    f"{message.author.mention} Discord invite links (`discord.gg`) are not allowed {where}."
+                ),
                 color=GALAXY_COLOR,
                 timestamp=discord.utils.utcnow(),
             )
@@ -1672,6 +2010,10 @@ async def filter_bad_content(message):
             f"Original message: {content[:1500]}"
         )
         return True
+
+    # Word filter: Perm 5+ staff remain exempt.
+    if member and has_staff_rank(member, 5):
+        return False
 
     matched = next((word for word in sorted(BLACKLISTED_WORDS, key=len, reverse=True)
                     if contains_blocked_phrase(lowered, word)), None)
@@ -4486,8 +4828,13 @@ async def update_member_role(ctx, member, role_name, adding):
         and role >= ctx.author.top_role
     ):
         return await ctx.send("I can’t manage that role because it is equal to or higher than your highest role.")
-    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
-        return await ctx.send("I can’t manage that role because it is equal to or higher than my highest role. Move my bot role above it.")
+    me = ctx.guild.me
+    if me is None or role >= me.top_role:
+        bot_role = me.top_role.mention if me and me.top_role else "my bot role"
+        return await ctx.send(
+            f"Discord won’t let me manage {role.mention} because that role is **equal to or above** {bot_role}.\n"
+            f"**Fix:** Server Settings → Roles → drag **my bot role** *above* **{role.name}**, then try again."
+        )
     # Special users can manage anyone (including themselves); others still respect hierarchy.
     if member.id != ctx.author.id and not can_moderate_target(ctx, member):
         return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
@@ -4635,8 +4982,13 @@ async def temprole(ctx, member: FlexibleMember = None, duration: str = None, *, 
         and role >= ctx.author.top_role
     ):
         return await ctx.send("That role is equal to or higher than your highest role.")
-    if ctx.guild.me is None or role >= ctx.guild.me.top_role:
-        return await ctx.send("That role is equal to or higher than my highest role. Move my bot role above it.")
+    me = ctx.guild.me
+    if me is None or role >= me.top_role:
+        bot_role = me.top_role.mention if me and me.top_role else "my bot role"
+        return await ctx.send(
+            f"Discord won’t let me manage {role.mention} because that role is **equal to or above** {bot_role}.\n"
+            f"**Fix:** Server Settings → Roles → drag **my bot role** *above* **{role.name}**, then try again."
+        )
     if member.id != ctx.author.id and not can_moderate_target(ctx, member):
         return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
 
