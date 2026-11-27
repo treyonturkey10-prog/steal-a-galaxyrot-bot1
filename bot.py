@@ -135,6 +135,7 @@ MEMBER_ALLOWED_COMMANDS = {
     "snipe", "editsnipe", "poll", "remind", "remindme", "botinfo", "uptime",
     "membercount", "mc", "help", "ping",
     "poker", "pokerduel", "1v1",
+    "deposit", "dep", "withdraw", "with", "rob",
 }
 
 # Restored from the previous Galaxy Bot word/scam filter. Perm 5+ staff are exempt.
@@ -632,10 +633,11 @@ for _bp in (
 
 
 def save_coin_backup():
-    """Write all balances to every reachable backup path."""
+    """Write all balances (wallet + bank) to every reachable backup path."""
     try:
         rows = db.execute(
-            "SELECT guild_id, user_id, balance, last_daily FROM galaxy_coins WHERE balance > 0"
+            "SELECT guild_id, user_id, balance, bank, last_daily FROM galaxy_coins "
+            "WHERE balance > 0 OR bank > 0"
         ).fetchall()
         payload = {
             "saved_at": time.time(),
@@ -644,9 +646,10 @@ def save_coin_backup():
                     "guild_id": int(g),
                     "user_id": int(u),
                     "balance": int(b),
+                    "bank": int(bk),
                     "last_daily": ld,
                 }
-                for g, u, b, ld in rows
+                for g, u, b, bk, ld in rows
             ],
         }
         text = json.dumps(payload)
@@ -664,10 +667,10 @@ def save_coin_backup():
 
 
 def restore_coins_from_backup_if_empty():
-    """If the live DB has no coins, try to reload from a JSON backup."""
+    """If the live DB has no coins at all (wallet + bank), reload from a JSON backup."""
     try:
         live = db.execute(
-            "SELECT COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
+            "SELECT COALESCE(SUM(balance + bank), 0) FROM galaxy_coins WHERE balance > 0 OR bank > 0"
         ).fetchone()[0]
         if int(live or 0) > 0:
             return False
@@ -680,7 +683,7 @@ def restore_coins_from_backup_if_empty():
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 rows = data.get("rows") or []
-                total = sum(int(r.get("balance") or 0) for r in rows)
+                total = sum(int(r.get("balance") or 0) + int(r.get("bank") or 0) for r in rows)
                 if total > best_total:
                     best_total = total
                     best = rows
@@ -690,15 +693,18 @@ def restore_coins_from_backup_if_empty():
             return False
         for r in best:
             db.execute(
-                "INSERT INTO galaxy_coins(guild_id,user_id,balance,last_daily) VALUES(?,?,?,?) "
+                "INSERT INTO galaxy_coins(guild_id,user_id,balance,bank,last_daily) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(guild_id,user_id) DO UPDATE SET "
                 "balance=CASE WHEN excluded.balance > galaxy_coins.balance "
                 "THEN excluded.balance ELSE galaxy_coins.balance END, "
+                "bank=CASE WHEN excluded.bank > galaxy_coins.bank "
+                "THEN excluded.bank ELSE galaxy_coins.bank END, "
                 "last_daily=COALESCE(excluded.last_daily, galaxy_coins.last_daily)",
                 (
                     int(r["guild_id"]),
                     int(r["user_id"]),
                     int(r.get("balance") or 0),
+                    int(r.get("bank") or 0),
                     r.get("last_daily"),
                 ),
             )
@@ -713,6 +719,19 @@ def restore_coins_from_backup_if_empty():
         logger.exception("restore_coins_from_backup_if_empty failed")
         return False
 
+
+try:
+    db.execute("ALTER TABLE galaxy_coins ADD COLUMN bank INTEGER NOT NULL DEFAULT 0")
+except sqlite3.OperationalError:
+    pass  # column already exists
+db.execute("""CREATE TABLE IF NOT EXISTS rob_log (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id, day)
+)""")
+db.commit()
 
 restore_coins_from_backup_if_empty()
 save_coin_backup()
@@ -939,6 +958,134 @@ def transfer_coins(guild_id, sender_id, recipient_id, amount):
     except Exception:
         db.rollback()
         raise
+
+ROB_DAILY_LIMIT = 3              # max rob attempts per person per day (resets 00:00 UTC, same as the daily clock)
+ROB_SUCCESS_CHANCE = 0.45        # 45% chance a rob works
+ROB_STEAL_MIN_PCT = 0.10         # successful rob steals 10%-30% of the victim's WALLET
+ROB_STEAL_MAX_PCT = 0.30
+ROB_FINE_PCT = 0.15              # failed rob: you pay 15% of your wallet to the victim
+ROB_MIN_VICTIM_WALLET = 100      # can't rob someone with less than this in their wallet
+ROB_MIN_ROBBER_WALLET = 100      # you need at least this to attempt (so the fine means something)
+
+
+def get_bank_balance(guild_id, user_id):
+    row = db.execute(
+        "SELECT bank FROM galaxy_coins WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _move_wallet_bank(guild_id, user_id, amount, to_bank):
+    """Atomically move coins wallet <-> bank. Returns (ok, wallet, bank)."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "INSERT OR IGNORE INTO galaxy_coins(guild_id,user_id,balance,bank) VALUES(?,?,0,0)",
+            (guild_id, user_id),
+        )
+        row = db.execute(
+            "SELECT balance, bank FROM galaxy_coins WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        wallet, bank = int(row[0]), int(row[1])
+        source, dest = (wallet, bank) if to_bank else (bank, wallet)
+        if amount <= 0 or source < amount or dest + amount > MAX_SQLITE_INT:
+            db.rollback()
+            return False, wallet, bank
+        if to_bank:
+            wallet, bank = wallet - amount, bank + amount
+        else:
+            wallet, bank = wallet + amount, bank - amount
+        db.execute(
+            "UPDATE galaxy_coins SET balance=?, bank=? WHERE guild_id=? AND user_id=?",
+            (wallet, bank, guild_id, user_id),
+        )
+        db.commit()
+        save_coin_backup()
+        return True, wallet, bank
+    except Exception:
+        db.rollback()
+        raise
+
+
+def rob_coins(guild_id, robber_id, victim_id, day):
+    """Atomically run one rob attempt. Only the victim's WALLET can be taken.
+
+    Returns a dict with a "status" key:
+      limit | robber_poor | victim_poor | success | failed
+    """
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM rob_log WHERE day <> ?", (day,))  # old days are irrelevant
+        row = db.execute(
+            "SELECT attempts FROM rob_log WHERE guild_id=? AND user_id=? AND day=?",
+            (guild_id, robber_id, day),
+        ).fetchone()
+        used = int(row[0]) if row else 0
+        if used >= ROB_DAILY_LIMIT:
+            db.commit()
+            return {"status": "limit", "used": used}
+
+        for uid in (robber_id, victim_id):
+            db.execute(
+                "INSERT OR IGNORE INTO galaxy_coins(guild_id,user_id,balance,bank) VALUES(?,?,0,0)",
+                (guild_id, uid),
+            )
+        r_wallet = int(db.execute(
+            "SELECT balance FROM galaxy_coins WHERE guild_id=? AND user_id=?",
+            (guild_id, robber_id)).fetchone()[0])
+        v_wallet = int(db.execute(
+            "SELECT balance FROM galaxy_coins WHERE guild_id=? AND user_id=?",
+            (guild_id, victim_id)).fetchone()[0])
+
+        # These checks do NOT use up an attempt.
+        if r_wallet < ROB_MIN_ROBBER_WALLET:
+            db.commit()
+            return {"status": "robber_poor", "wallet": r_wallet}
+        if v_wallet < ROB_MIN_VICTIM_WALLET:
+            db.commit()
+            return {"status": "victim_poor", "wallet": v_wallet}
+
+        db.execute(
+            "INSERT INTO rob_log(guild_id,user_id,day,attempts) VALUES(?,?,?,1) "
+            "ON CONFLICT(guild_id,user_id,day) DO UPDATE SET attempts=attempts+1",
+            (guild_id, robber_id, day),
+        )
+        used += 1
+        left = ROB_DAILY_LIMIT - used
+
+        if random.random() < ROB_SUCCESS_CHANCE:
+            amount = int(v_wallet * random.uniform(ROB_STEAL_MIN_PCT, ROB_STEAL_MAX_PCT))
+            amount = max(1, min(amount, v_wallet))
+            db.execute(
+                "UPDATE galaxy_coins SET balance=? WHERE guild_id=? AND user_id=?",
+                (v_wallet - amount, guild_id, victim_id),
+            )
+            r_new = clamp_coins(r_wallet + amount)
+            db.execute(
+                "UPDATE galaxy_coins SET balance=? WHERE guild_id=? AND user_id=?",
+                (r_new, guild_id, robber_id),
+            )
+            result = {"status": "success", "amount": amount, "wallet": r_new, "left": left}
+        else:
+            fine = max(1, min(int(r_wallet * ROB_FINE_PCT), r_wallet))
+            db.execute(
+                "UPDATE galaxy_coins SET balance=? WHERE guild_id=? AND user_id=?",
+                (r_wallet - fine, guild_id, robber_id),
+            )
+            v_new = clamp_coins(v_wallet + fine)
+            db.execute(
+                "UPDATE galaxy_coins SET balance=? WHERE guild_id=? AND user_id=?",
+                (v_new, guild_id, victim_id),
+            )
+            result = {"status": "failed", "amount": fine, "wallet": r_wallet - fine, "left": left}
+        db.commit()
+        save_coin_backup()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+
 
 GALAXY_QUESTIONS = [
     # EASY
@@ -3552,7 +3699,11 @@ async def galaxy_balance(ctx, member: FlexibleMember = None):
     balance = get_coin_balance(ctx.guild.id, member.id)
     embed = discord.Embed(
         title="GALAXY  /  BALANCE",
-        description=f"{member.mention}\n**{balance:,}** Galaxy Coins",
+        description=(
+            f"{member.mention}\n"
+            f"**Wallet:** {balance:,} Galaxy Coins\n"
+            f"**Bank:** {get_bank_balance(ctx.guild.id, member.id):,} Galaxy Coins"
+        ),
         color=GALAXY_ACCENT,
         timestamp=discord.utils.utcnow(),
     )
@@ -4020,6 +4171,186 @@ async def galaxy_dice(ctx, amount: str):
         await spin.edit(embed=panel)
     except (discord.NotFound, discord.HTTPException):
         await ctx.send(embed=panel)
+
+
+@bot.command(name="deposit", aliases=["dep"])
+@commands.guild_only()
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def galaxy_deposit(ctx, amount: str):
+    """Move coins from your wallet into your bank (the bank can't be robbed)."""
+    wallet_now = get_coin_balance(ctx.guild.id, ctx.author.id)
+    try:
+        amount = parse_coin_amount(amount, current_balance=wallet_now)
+    except ValueError:
+        return await ctx.send(f"Enter a valid amount (example: `{PREFIX}deposit 500`, `{PREFIX}deposit all`).")
+    if amount < 1:
+        return await ctx.send("You need to deposit at least **1 Galaxy Coin**.")
+    ok, wallet, bank = _move_wallet_bank(ctx.guild.id, ctx.author.id, amount, to_bank=True)
+    if not ok:
+        return await ctx.send(f"You only have **{wallet:,}** Galaxy Coins in your wallet.")
+    await ctx.send(embed=build_galaxy_embed(
+        f"🏦 {ctx.author.mention} deposited **{amount:,}** Galaxy Coins.\n\n"
+        f"**Wallet:** {wallet:,}\n**Bank:** {bank:,}\n"
+        f"Banked coins can't be robbed.",
+        title="GALAXY  /  DEPOSIT", color=SUCCESS_COLOR, footer="GALAXY  ·  BANK",
+    ))
+
+
+@bot.command(name="withdraw", aliases=["with"])
+@commands.guild_only()
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def galaxy_withdraw(ctx, amount: str):
+    """Move coins from your bank back to your wallet."""
+    bank_now = get_bank_balance(ctx.guild.id, ctx.author.id)
+    try:
+        amount = parse_coin_amount(amount, current_balance=bank_now)
+    except ValueError:
+        return await ctx.send(f"Enter a valid amount (example: `{PREFIX}withdraw 500`, `{PREFIX}withdraw all`).")
+    if amount < 1:
+        return await ctx.send("You need to withdraw at least **1 Galaxy Coin**.")
+    ok, wallet, bank = _move_wallet_bank(ctx.guild.id, ctx.author.id, amount, to_bank=False)
+    if not ok:
+        return await ctx.send(f"You only have **{bank:,}** Galaxy Coins in your bank.")
+    await ctx.send(embed=build_galaxy_embed(
+        f"🏦 {ctx.author.mention} withdrew **{amount:,}** Galaxy Coins.\n\n"
+        f"**Wallet:** {wallet:,}\n**Bank:** {bank:,}",
+        title="GALAXY  /  WITHDRAW", color=GALAXY_ACCENT, footer="GALAXY  ·  BANK",
+    ))
+
+
+@bot.command(name="rob")
+@commands.guild_only()
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def galaxy_rob(ctx, member: FlexibleMember):
+    """Try to rob another member's WALLET. Limit: 3 attempts per day."""
+    if member.bot:
+        return await ctx.send("Bots don't carry coins, so there's nothing to rob.")
+    if member.id == ctx.author.id:
+        return await ctx.send("You can't rob yourself.")
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    result = rob_coins(ctx.guild.id, ctx.author.id, member.id, day)
+    status = result["status"]
+
+    if status == "limit":
+        return await ctx.send(embed=build_galaxy_embed(
+            f"{ctx.author.mention} you've already used all **{ROB_DAILY_LIMIT}** of your rob attempts today.\n"
+            "Come back after the daily reset (00:00 UTC).",
+            title="GALAXY  /  ROB LIMIT", color=WARN_COLOR, footer="GALAXY  ·  CASINO",
+        ))
+    if status == "robber_poor":
+        return await ctx.send(
+            f"You need at least **{ROB_MIN_ROBBER_WALLET:,}** coins in your wallet to try a rob "
+            f"(you have **{result['wallet']:,}**). This didn't use an attempt."
+        )
+    if status == "victim_poor":
+        return await ctx.send(
+            f"{member.mention} doesn't have enough in their wallet to be worth robbing "
+            f"(they need at least **{ROB_MIN_VICTIM_WALLET:,}**). This didn't use an attempt."
+        )
+
+    left = result["left"]
+    attempts_text = f"Rob attempts left today: **{left}/{ROB_DAILY_LIMIT}**"
+    if status == "success":
+        panel = build_galaxy_embed(
+            f"🦹 {ctx.author.mention} robbed {member.mention} and got away with "
+            f"**{result['amount']:,}** Galaxy Coins!\n\n"
+            f"Your wallet: **{result['wallet']:,}**\n{attempts_text}",
+            title="GALAXY  /  ROB SUCCESS", color=SUCCESS_COLOR, footer="GALAXY  ·  CASINO",
+        )
+    else:
+        panel = build_galaxy_embed(
+            f"🚨 {ctx.author.mention} got caught trying to rob {member.mention} and paid them a fine of "
+            f"**{result['amount']:,}** Galaxy Coins.\n\n"
+            f"Your wallet: **{result['wallet']:,}**\n{attempts_text}",
+            title="GALAXY  /  ROB FAILED", color=ERROR_COLOR, footer="GALAXY  ·  CASINO",
+        )
+    await ctx.send(embed=panel)
+    asyncio.create_task(send_mod_log(
+        ctx.guild,
+        f"🦹 **Rob ({status})**\nRobber: {ctx.author} (`{ctx.author.id}`)\n"
+        f"Victim: {member} (`{member.id}`)\nAmount: **{result['amount']:,}**\nAttempts left: {left}",
+    ))
+
+
+RESET_COINS_ROLE_IDS = {
+    ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"],
+}
+
+
+def require_coowner_role():
+    async def predicate(ctx):
+        return ctx.guild is not None and bool(member_role_ids(ctx.author) & RESET_COINS_ROLE_IDS)
+    return commands.check(predicate)
+
+
+@bot.command(name="resetcoins", aliases=["coinreset", "resetbal"])
+@commands.guild_only()
+@require_coowner_role()
+async def galaxy_reset_coins(ctx, target: str = None, *, extra: str = ""):
+    """Reset wallet + bank to 0.
+    +resetcoins @user
+    +resetcoins all confirm   (everyone in this server)
+    """
+    if target is None:
+        return await ctx.send(
+            f"Usage: `{PREFIX}resetcoins @user` or `{PREFIX}resetcoins all confirm` "
+            f"(resets wallet **and** bank)."
+        )
+
+    if target.lower() in {"all", "everyone", "server"}:
+        if extra.strip().lower() != "confirm":
+            return await ctx.send(embed=build_galaxy_embed(
+                "This would reset **every member's** wallet and bank in this server to **0**.\n"
+                f"If you're sure, run `{PREFIX}resetcoins all confirm`.",
+                title="GALAXY  /  CONFIRM RESET", color=WARN_COLOR, footer="GALAXY  ·  COINS",
+            ))
+        holders, total = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(balance + bank), 0) FROM galaxy_coins "
+            "WHERE guild_id=? AND (balance > 0 OR bank > 0)",
+            (ctx.guild.id,),
+        ).fetchone()
+        db.execute("UPDATE galaxy_coins SET balance=0, bank=0 WHERE guild_id=?", (ctx.guild.id,))
+        db.execute("DELETE FROM rob_log WHERE guild_id=?", (ctx.guild.id,))
+        db.commit()
+        save_coin_backup()
+        await ctx.send(embed=build_galaxy_embed(
+            f"Reset **{int(holders):,}** players and removed **{int(total):,}** Galaxy Coins in total.",
+            title="GALAXY  /  ALL COINS RESET", color=ERROR_COLOR, footer="GALAXY  ·  COINS",
+        ))
+        asyncio.create_task(send_mod_log(
+            ctx.guild,
+            f"🧨 **ALL Galaxy Coins reset**\nPlayers: {int(holders):,}\nCoins removed: **{int(total):,}**\n"
+            f"By: {ctx.author} (`{ctx.author.id}`)",
+        ))
+        return
+
+    try:
+        user = await resolve_user_arg(ctx, target)
+    except commands.BadArgument:
+        return await ctx.send("I couldn't find that user. Use a mention or their user ID.")
+    row = db.execute(
+        "SELECT balance, bank FROM galaxy_coins WHERE guild_id=? AND user_id=?",
+        (ctx.guild.id, user.id),
+    ).fetchone()
+    old_wallet, old_bank = (int(row[0]), int(row[1])) if row else (0, 0)
+    db.execute(
+        "UPDATE galaxy_coins SET balance=0, bank=0 WHERE guild_id=? AND user_id=?",
+        (ctx.guild.id, user.id),
+    )
+    db.commit()
+    save_coin_backup()
+    await ctx.send(embed=build_galaxy_embed(
+        f"Reset {getattr(user, 'mention', user)} to **0** Galaxy Coins.\n"
+        f"Removed **{old_wallet:,}** from their wallet and **{old_bank:,}** from their bank.",
+        title="GALAXY  /  COINS RESET", color=WARN_COLOR, footer="GALAXY  ·  COINS",
+    ))
+    asyncio.create_task(send_mod_log(
+        ctx.guild,
+        f"🧨 **Galaxy Coins reset**\nUser: {user} (`{user.id}`)\n"
+        f"Wallet removed: **{old_wallet:,}** · Bank removed: **{old_bank:,}**\n"
+        f"By: {ctx.author} (`{ctx.author.id}`)",
+    ))
 
 
 def require_ban():
@@ -6916,6 +7247,8 @@ async def help(ctx):
         value=(
             f"`{PREFIX}balance` / `{PREFIX}bal`  `{PREFIX}daily`  `{PREFIX}tradecoins` / `{PREFIX}givecoins`\n"
             f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}slots`  `{PREFIX}dice`\n"
+            f"`{PREFIX}deposit <amount|all>`  `{PREFIX}withdraw <amount|all>`  `{PREFIX}rob @user` (3 per day)\n"
+            f"`{PREFIX}resetcoins @user` / `{PREFIX}resetcoins all confirm` (Co-Owner+ by role)\n"
             f"`{PREFIX}riddle`  `{PREFIX}endriddle` (staff)  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
             "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
