@@ -2022,7 +2022,7 @@ def build_snipe_embed(entry, index, total):
     # Show newest as page 1 when listing from newest-first for the user
     page = total - index  # newest = page 1
     panel = discord.Embed(
-        title="GALAXY  /  SNIPE",
+        title="GALAXY  /  SNIPE  ·  DELETED",
         description=safe_content,
         color=GALAXY_COLOR,
         timestamp=entry.get("deleted_at") or discord.utils.utcnow(),
@@ -2051,7 +2051,7 @@ def build_snipe_embed(entry, index, total):
     return panel
 
 
-def build_editsnipe_embed(entry, index, total):
+def build_editsnipe_embed(entry, index, total, *, title="GALAXY  /  EDIT SNIPE", label="EDIT SNIPE"):
     before = entry.get("before") or "*empty*"
     after = entry.get("after") or "*empty*"
     safe_before = discord.utils.escape_mentions(before)
@@ -2062,7 +2062,7 @@ def build_editsnipe_embed(entry, index, total):
         safe_after = safe_after[:897] + "..."
     page = total - index
     panel = discord.Embed(
-        title="GALAXY  /  EDIT SNIPE",
+        title=title,
         color=GALAXY_COLOR,
         timestamp=entry.get("edited_at") or discord.utils.utcnow(),
     )
@@ -2077,7 +2077,7 @@ def build_editsnipe_embed(entry, index, total):
     if entry.get("jump_url"):
         panel.add_field(name="Jump", value=f"[Open message]({entry['jump_url']})", inline=True)
     panel.set_footer(
-        text=f"GALAXY  ·  EDIT SNIPE  ·  {page}/{total}  ·  ◀ older  ·  newer ▶"
+        text=f"GALAXY  ·  {label}  ·  {page}/{total}  ·  ◀ older  ·  newer ▶"
     )
     return panel
 
@@ -2100,6 +2100,11 @@ class SnipeBrowser(discord.ui.View):
         total = len(self.entries)
         if self.kind == "editsnipe":
             return build_editsnipe_embed(entry, self.index, total)
+        if "before" in entry:  # an edited message mixed into the +snipe history
+            return build_editsnipe_embed(
+                entry, self.index, total,
+                title="GALAXY  /  SNIPE  ·  EDITED", label="SNIPE",
+            )
         return build_snipe_embed(entry, self.index, total)
 
     def _sync_buttons(self):
@@ -2902,7 +2907,6 @@ async def on_message(message):
             active_codes.pop(message.guild.id, None)
         elif (
             message.channel.id == active_code["channel_id"]
-            and message.author.id != active_code["starter_id"]
             and message.content.strip().upper() == active_code["code"]
         ):
             active_codes.pop(message.guild.id, None)  # pop before any await: first person wins
@@ -3034,10 +3038,15 @@ async def on_message_edit(before, after):
 @bot.command(name="snipe")
 @commands.guild_only()
 async def snipe(ctx):
-    """Browse recently deleted messages in this channel (◀ older / newer ▶)."""
-    history = sniped_messages.get(ctx.channel.id) or []
+    """Browse recently deleted AND edited messages in this channel (◀ older / newer ▶).
+
+    Edited messages show the text before and after the edit.
+    """
+    history = list(sniped_messages.get(ctx.channel.id) or []) + list(edited_messages.get(ctx.channel.id) or [])
+    # Oldest -> newest by when the delete/edit happened; the browser opens on the newest.
+    history.sort(key=lambda e: e.get("deleted_at") or e.get("edited_at") or discord.utils.utcnow())
     if not history:
-        return await ctx.send("There isn’t a recently deleted message saved for this channel.")
+        return await ctx.send("There isn’t a recently deleted or edited message saved for this channel.")
 
     view = SnipeBrowser(history, kind="snipe", author_id=ctx.author.id, timeout=120)
     embed = view._embed()
@@ -6066,7 +6075,8 @@ def require_asm_plus():
 
 
 CODE_EXPIRE_SECONDS = 10 * 60      # an unclaimed code expires after 10 minutes
-CODE_PING_ROLE_ID = 1571339142816858132  # role pinged whenever a code drops
+CODE_PING_ROLE_ID = 1571339142816858132  # role that can get pinged when a code drops
+CODE_PING_CHANCE = 0.45  # chance (0.0-1.0) that a drop pings the role; same idea as the riddle ping
 MAX_CODE_REWARD = 1_000_000        # safety cap so a typo can't print a fortune
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I confusion
 active_codes = {}                  # guild_id -> {"code", "amount", "channel_id", ...}
@@ -6141,13 +6151,16 @@ async def code_cmd(ctx, amount: str = None):
         f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
         title="GALAXY  /  CODE DROP", color=GALAXY_ACCENT, footer="GALAXY  ·  CODE DROP",
     )
-    ping_text = f"<@&{CODE_PING_ROLE_ID}>"
-    sent = await ctx.send(
-        content=ping_text,
-        embed=panel,
-        allowed_mentions=discord.AllowedMentions(
-            roles=[discord.Object(id=CODE_PING_ROLE_ID)], users=False, everyone=False),
-    )
+    # Only sometimes ping the role, so drops don't ping every single time.
+    if random.random() < CODE_PING_CHANCE:
+        sent = await ctx.send(
+            content=f"<@&{CODE_PING_ROLE_ID}>",
+            embed=panel,
+            allowed_mentions=discord.AllowedMentions(
+                roles=[discord.Object(id=CODE_PING_ROLE_ID)], users=False, everyone=False),
+        )
+    else:
+        sent = await ctx.send(embed=panel, allowed_mentions=discord.AllowedMentions.none())
     active_codes[ctx.guild.id] = {
         "code": code, "amount": reward, "channel_id": ctx.channel.id,
         "message_id": sent.id, "starter_id": ctx.author.id, "expires_at": expires_at,
@@ -6602,7 +6615,7 @@ async def help(ctx):
         title="GALAXY  /  COMMAND GUIDE",
         description=(
             f"Commands use the `{PREFIX}` prefix. Reply to a member’s message to use them as the target "
-            f"for supported moderation commands. `{PREFIX}snipe` browses deleted messages with ◀ ▶ arrows; `{PREFIX}editsnipe` does the same for edits."
+            f"for supported moderation commands. `{PREFIX}snipe` browses deleted and edited messages (with before/after) using ◀ ▶ arrows; `{PREFIX}editsnipe` does the same for edits."
         ),
         color=GALAXY_COLOR,
         timestamp=discord.utils.utcnow(),
