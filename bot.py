@@ -2902,24 +2902,31 @@ async def on_message(message):
             except (discord.Forbidden, discord.HTTPException):
                 logger.exception("Failed to send no-ping panel in %s", message.channel.id)
             return
-    # +code drops: the first person to type the active code in its channel wins coins.
-    active_code = active_codes.get(message.guild.id)
-    if active_code:
+    # Code drops: the first person to type the active code in its channel wins coins.
+    # Staff +code drops and the bot's automatic drops live in separate slots, so
+    # an automatic drop never cancels a staff drop (or the other way around).
+    for slot in ("manual", "auto"):
+        key = (message.guild.id, slot)
+        active_code = active_codes.get(key)
+        if not active_code:
+            continue
         if time.time() > active_code["expires_at"]:
-            active_codes.pop(message.guild.id, None)
-        elif message.channel.id == active_code["channel_id"]:
-            typed = message.content.strip().upper()
-            if typed == active_code["code"]:
-                active_codes.pop(message.guild.id, None)  # pop before any await: first person wins
-                await _award_code_claim(message, active_code)
-                return
-            if typed != active_code["code"] and _strip_invisible(typed) == active_code["code"]:
-                # Copy-pasted from the panel (hidden characters came along): not a valid claim.
-                try:
-                    await message.add_reaction("❌")
-                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                    pass
-                return
+            active_codes.pop(key, None)
+            continue
+        if message.channel.id != active_code["channel_id"]:
+            continue
+        typed = message.content.strip().upper()
+        if typed == active_code["code"]:
+            active_codes.pop(key, None)  # pop before any await: first person wins
+            await _award_code_claim(message, active_code)
+            return
+        if _strip_invisible(typed) == active_code["code"]:
+            # Copy-pasted from the panel (hidden characters came along): not a valid claim.
+            try:
+                await message.add_reaction("❌")
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+            return
     # Never run content filtering against commands. This keeps command messages
     # (including +sanctions) from being intercepted by the chat-content filter.
     if not message.content.startswith(PREFIX):
@@ -6099,10 +6106,10 @@ def require_director_plus():
 
 CODE_EXPIRE_SECONDS = 10 * 60      # an unclaimed code expires after 10 minutes
 CODE_PING_ROLE_ID = 1571339142816858132  # role that can get pinged when a code drops
-CODE_PING_CHANCE = 0.45  # chance (0.0-1.0) that a drop pings the role; same idea as the riddle ping
+CODE_PING_CHANCE = 0.45  # chance (0.0-1.0) that an AUTOMATIC drop pings the role (+code always pings)
 MAX_CODE_REWARD = 1_000_000        # safety cap so a typo can't print a fortune
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I confusion
-active_codes = {}                  # guild_id -> {"code", "amount", "channel_id", ...}
+active_codes = {}                  # (guild_id, "manual"|"auto") -> {"code", "amount", "channel_id", ...}
 
 
 async def _award_code_claim(message, active):
@@ -6113,7 +6120,7 @@ async def _award_code_claim(message, active):
         new_bal = get_coin_balance(guild_id, message.author.id)
     except Exception:
         logger.exception("Code payout failed for user %s", message.author.id)
-        active_codes[guild_id] = active  # put it back so the code isn't wasted
+        active_codes[(guild_id, active.get("slot", "manual"))] = active  # put it back so the code isn't wasted
         return
     panel = build_galaxy_embed(
         f"› {message.author.mention} typed the code first and won "
@@ -6164,11 +6171,11 @@ def _strip_invisible(text):
 AUTO_CODE_CHANNEL_ID = 1575961199047348366   # channel where the bot drops codes by itself
 AUTO_CODE_MIN = 1                            # smallest automatic reward (coins)
 AUTO_CODE_MAX = 50_000_000_000               # biggest automatic reward: 50b coins
-AUTO_CODE_INTERVAL_SECONDS = 60 * 60         # auto-drop if no code was dropped for this long
-last_code_drop_at = {}                       # guild_id -> time of the latest drop (command or automatic)
+AUTO_CODE_INTERVAL_SECONDS = 30 * 60         # an automatic drop every 30 minutes, whether or not staff used +code
+last_auto_code_at = {}                       # guild_id -> time of the latest AUTOMATIC drop
 
 
-async def _send_code_drop(channel, reward, starter_id, starter_label):
+async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual"):
     """Post a code drop in `channel` and start tracking it. Used by +code and the auto drops."""
     guild = channel.guild
     code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
@@ -6179,8 +6186,8 @@ async def _send_code_drop(channel, reward, starter_id, starter_label):
         f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
         title="GALAXY  /  CODE DROP", color=GALAXY_ACCENT, footer="GALAXY  ·  CODE DROP",
     )
-    # Only sometimes ping the role, so drops don't ping every single time.
-    if random.random() < CODE_PING_CHANCE:
+    # +code always pings the role; automatic drops only ping some of the time.
+    if always_ping or random.random() < CODE_PING_CHANCE:
         sent = await channel.send(
             content=f"<@&{CODE_PING_ROLE_ID}>",
             embed=panel,
@@ -6190,11 +6197,10 @@ async def _send_code_drop(channel, reward, starter_id, starter_label):
     else:
         sent = await channel.send(embed=panel, allowed_mentions=discord.AllowedMentions.none())
     now = time.time()
-    active_codes[guild.id] = {
-        "code": code, "amount": reward, "channel_id": channel.id,
+    active_codes[(guild.id, slot)] = {
+        "code": code, "amount": reward, "channel_id": channel.id, "slot": slot,
         "message_id": sent.id, "starter_id": starter_id, "expires_at": now + CODE_EXPIRE_SECONDS,
     }
-    last_code_drop_at[guild.id] = now
     await send_mod_log(
         guild,
         f"🎟️ **Code dropped**\nBy: {starter_label}\nChannel: {channel.mention}\nReward: {reward:,}",
@@ -6203,27 +6209,25 @@ async def _send_code_drop(channel, reward, starter_id, starter_label):
 
 
 async def auto_code_scheduler():
-    """If nobody has dropped a code for a while, drop one by itself in the code channel."""
+    """Drop a code by itself in the code channel every AUTO_CODE_INTERVAL_SECONDS (30 min)."""
     await bot.wait_until_ready()
     # Start the clock at boot so a restart never fires a code instantly.
     for guild in bot.guilds:
-        last_code_drop_at.setdefault(guild.id, time.time())
+        last_auto_code_at.setdefault(guild.id, time.time())
     while not bot.is_closed():
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
         try:
             for guild in bot.guilds:
                 channel = guild.get_channel(AUTO_CODE_CHANNEL_ID)
                 if not isinstance(channel, discord.TextChannel):
                     continue
                 now = time.time()
-                last = last_code_drop_at.setdefault(guild.id, now)
-                current = active_codes.get(guild.id)
-                if current and now < current["expires_at"]:
-                    continue  # a code is still live
+                last = last_auto_code_at.setdefault(guild.id, now)
                 if now - last < AUTO_CODE_INTERVAL_SECONDS:
-                    continue  # someone dropped one recently (command or automatic)
+                    continue
+                last_auto_code_at[guild.id] = now  # reset first so a failure can't loop-spam
                 reward = random.randint(AUTO_CODE_MIN, AUTO_CODE_MAX)
-                await _send_code_drop(channel, reward, bot.user.id, "automatic drop (bot)")
+                await _send_code_drop(channel, reward, bot.user.id, "automatic drop (bot)", slot="auto")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6235,7 +6239,7 @@ async def auto_code_scheduler():
 @require_director_plus()
 async def code_cmd(ctx, amount: str = None):
     """Drop a code in this channel. First person to type it wins coins. +code [amount]"""
-    current = active_codes.get(ctx.guild.id)
+    current = active_codes.get((ctx.guild.id, "manual"))
     if current and time.time() < current["expires_at"]:
         return await ctx.send(
             f"There's already an active code in <#{current['channel_id']}>. "
@@ -6251,7 +6255,8 @@ async def code_cmd(ctx, amount: str = None):
         if not 1 <= reward <= MAX_CODE_REWARD:
             return await ctx.send(f"The reward must be between **1** and **{MAX_CODE_REWARD:,}** coins.")
 
-    await _send_code_drop(ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)")
+    await _send_code_drop(
+        ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)", always_ping=True)
 
 
 # ----------------------------- 1v1 POKER -----------------------------------
