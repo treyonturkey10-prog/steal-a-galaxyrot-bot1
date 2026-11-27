@@ -74,6 +74,8 @@ JOIN_GHOST_PING_CHANNELS = (
     (1549949873468604438, "chat"),
 )
 JOIN_GHOST_PING_CHANNEL_IDS = tuple(cid for cid, _ in JOIN_GHOST_PING_CHANNELS)
+# Seconds the join ping stays up before it is deleted (so it isn't an instant ghost ping).
+JOIN_GHOST_PING_DELETE_DELAY = 2.0
 GALAXY_QUESTION_REWARD_MIN = 50
 GALAXY_QUESTION_REWARD_MAX = 250
 GALAXY_LEADERBOARD_CHANNEL_ID = 1549950104516165682
@@ -1633,10 +1635,22 @@ async def enforce_blacklist_ban(guild, user, *, event_label="blacklisted user"):
     return True
 
 
-@bot.event
-async def ghost_ping_new_member(member):
-    """Mention a new member in key channels so they get notified, then delete the pings.
+async def _delete_after_delay(msg, delay, member_id=None):
+    """Delete a message after `delay` seconds (runs in the background)."""
+    try:
+        await asyncio.sleep(delay)
+        await msg.delete()
+    except discord.NotFound:
+        pass  # already gone
+    except (discord.Forbidden, discord.HTTPException):
+        logger.warning("Could not delete join ping %s for member %s", msg.id, member_id)
 
+
+async def ghost_ping_new_member(member):
+    """Mention a new member in key channels so they get notified, then delete
+    each ping after JOIN_GHOST_PING_DELETE_DELAY seconds (not instantly).
+
+    Deletes run in the background so the welcome DM isn't held up.
     Returns a list of (channel, label) that were successfully pinged.
     """
     guild = member.guild
@@ -1650,49 +1664,39 @@ async def ghost_ping_new_member(member):
                 member.mention,
                 allowed_mentions=discord.AllowedMentions(users=[member]),
             )
-            pinged.append((channel, label))
-            try:
-                await msg.delete()
-            except (discord.Forbidden, discord.HTTPException):
-                try:
-                    await asyncio.sleep(1.0)
-                    await msg.delete()
-                except (discord.Forbidden, discord.HTTPException):
-                    logger.warning(
-                        "Could not delete join ghost-ping in channel %s for member %s",
-                        channel_id, member.id,
-                    )
         except (discord.Forbidden, discord.HTTPException):
             logger.warning(
-                "Could not send join ghost-ping in channel %s for member %s",
+                "Could not send join ping in channel %s for member %s",
                 channel_id, member.id,
             )
+            continue
+        pinged.append((channel, label))
+        asyncio.create_task(_delete_after_delay(msg, JOIN_GHOST_PING_DELETE_DELAY, member.id))
     return pinged
 
 
 async def dm_join_channel_guide(member, pinged_channels):
     """DM the new member a polished guide of channels they were notified in."""
-    if not pinged_channels:
-        return
     guild = member.guild
     server_name = discord.utils.escape_markdown(guild.name)
 
-    # Build a clean channel list with live mentions
-    lines = []
-    for channel, label in pinged_channels:
-        name = getattr(channel, "name", None) or label
+    if pinged_channels:
         # channel.mention is clickable in DMs for mutual servers
-        lines.append(f"› {channel.mention}")
-    channel_block = "\n".join(lines)
-
-    embed = discord.Embed(
-        title="You were pinged in these channels",
-        description=(
+        channel_block = "\n".join(f"› {channel.mention}" for channel, _label in pinged_channels)
+        body = (
             f"Welcome to **{server_name}**.\n\n"
             f"I pinged you in a few important places so you can find them fast:\n\n"
             f"{channel_block}\n\n"
             f"Tap a channel above to jump in — or open them from the server list anytime."
-        ),
+        )
+        title = "You were pinged in these channels"
+    else:
+        body = f"Welcome to **{server_name}**. Glad to have you here."
+        title = f"Welcome to {server_name}"
+
+    embed = discord.Embed(
+        title=title,
+        description=body,
         color=GALAXY_ACCENT,
         timestamp=discord.utils.utcnow(),
     )
@@ -1714,8 +1718,11 @@ async def dm_join_channel_guide(member, pinged_channels):
     embed.set_footer(text=f"Glad you're here  ·  {server_name}")
     try:
         await member.send(embed=embed)
-    except (discord.Forbidden, discord.HTTPException):
-        logger.info("Could not DM join guide to %s (DMs closed?)", member.id)
+        logger.info("Sent join DM to %s (%s)", member, member.id)
+    except discord.Forbidden:
+        logger.warning("Could not DM join guide to %s — their DMs are closed or they blocked the bot", member.id)
+    except discord.HTTPException:
+        logger.exception("Discord error while DMing join guide to %s", member.id)
 
 
 @bot.event
@@ -1728,11 +1735,16 @@ async def on_member_join(member):
 
     # Ghost-ping key channels so the member is notified, without leaving messages,
     # then DM them a clean guide of where they were pinged.
+    pinged = []
     try:
         pinged = await ghost_ping_new_member(member)
+    except Exception:
+        logger.exception("Join ping failed for member %s", member.id)
+    # DM is always attempted, even if a ping failed.
+    try:
         await dm_join_channel_guide(member, pinged)
     except Exception:
-        logger.exception("Join ghost-ping / welcome DM failed for member %s", member.id)
+        logger.exception("Welcome DM failed for member %s", member.id)
 
     # Invite tracking only: welcome messages have intentionally been removed.
     inviter_text = await get_inviter_text(guild)
