@@ -2162,27 +2162,205 @@ def member_command_is_allowed(member, command):
     return bool(names & MEMBER_ALLOWED_COMMANDS)
 
 
+def _giveaway_message_text(message):
+    """Flatten GiveawayBot message content + embeds into one string."""
+    parts = [message.content or ""]
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            parts.append(field.name or "")
+            parts.append(field.value or "")
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+        if embed.author and embed.author.name:
+            parts.append(embed.author.name)
+    return "\n".join(parts)
+
+
 def is_giveaway_announcement(message):
     if message.author.id != GIVEAWAY_BOT_ID:
         return False
-    combined_parts = [message.content or ""]
-    for embed in message.embeds:
-        if embed.title:
-            combined_parts.append(embed.title)
-        if embed.description:
-            combined_parts.append(embed.description)
-        for field in embed.fields:
-            combined_parts.append(field.name or "")
-            combined_parts.append(field.value or "")
-        if embed.footer and embed.footer.text:
-            combined_parts.append(embed.footer.text)
-    text = "\n".join(combined_parts).lower()
+    text = _giveaway_message_text(message).lower()
     if not text.strip():
         return False
     # Ignore giveaway winner/end/reroll announcements
-    if "congratulations!" in text or "won the giveaway" in text or "has ended" in text:
+    if "congratulations" in text or "won the" in text or "has ended" in text:
         return False
     return any(marker in text for marker in ("click 🎉", "button to enter", "hosted by:", "ends:", "winners:"))
+
+
+def is_giveaway_winner_announcement(message):
+    """True when GiveawayBot posts a winner / end message."""
+    if message.author.id != GIVEAWAY_BOT_ID:
+        return False
+    text = _giveaway_message_text(message).lower()
+    if not text.strip():
+        return False
+    return (
+        "congratulations" in text
+        or "won the" in text
+        or ("winner" in text and ("giveaway" in text or "prize" in text))
+    )
+
+
+# Channel/message cache: recent giveaway prizes that look like Galaxy Coins.
+# Keyed by channel_id -> list of (message_id, amount, raw_prize, expires_at)
+_giveaway_coin_prizes = {}
+_GIVEAWAY_PRIZE_TTL = 14 * 24 * 3600  # keep for 14 days
+
+
+def parse_galaxy_coin_amount(text: str):
+    """Extract a Galaxy Coin prize amount from giveaway title/description text.
+
+    Accepts forms like:
+      1000 galaxy coins / 1,000 GC / 500 coins / **250 galaxy coin**
+    Returns int amount or None if this does not look like a coin giveaway.
+    """
+    if not text:
+        return None
+    lowered = text.lower().replace(",", "")
+    # Must look coin-related (avoid giving coins for nitro/robux/etc. giveaways)
+    coinish = any(
+        token in lowered
+        for token in (
+            "galaxy coin", "galaxy coins", "galaxycoin", "galaxycoins",
+            " gc", "gc ", "gc\n", "(gc)", "[gc]",
+            "coins", "coin",
+        )
+    )
+    if not coinish:
+        return None
+    # Prefer explicit "galaxy coin(s)" amounts first
+    patterns = [
+        r"(\d[\d\s]*)\s*(?:x\s*)?galaxy\s*coins?",
+        r"galaxy\s*coins?\s*[:=\-]?\s*(\d[\d\s]*)",
+        r"(\d[\d\s]*)\s*(?:x\s*)?gc\b",
+        r"\bgc\s*[:=\-]?\s*(\d[\d\s]*)",
+        r"(\d[\d\s]*)\s*(?:x\s*)?coins?\b",
+        r"\bcoins?\s*[:=\-]?\s*(\d[\d\s]*)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, lowered, flags=re.IGNORECASE)
+        if m:
+            digits = re.sub(r"\D", "", m.group(1))
+            if digits:
+                try:
+                    amount = int(digits)
+                except ValueError:
+                    continue
+                if 1 <= amount <= MAX_SQLITE_INT:
+                    return amount
+    return None
+
+
+def remember_giveaway_coin_prize(message, amount: int, raw_prize: str = ""):
+    channel_id = message.channel.id
+    now = time.time()
+    bucket = _giveaway_coin_prizes.setdefault(channel_id, [])
+    # drop expired
+    bucket[:] = [row for row in bucket if row[3] > now]
+    bucket.append((message.id, int(amount), raw_prize[:200], now + _GIVEAWAY_PRIZE_TTL))
+    # keep last 30 per channel
+    if len(bucket) > 30:
+        del bucket[:-30]
+
+
+def lookup_giveaway_coin_prize(message, text: str):
+    """Find coin amount from this winner message or a recent start in the same channel."""
+    amount = parse_galaxy_coin_amount(text)
+    if amount:
+        return amount
+    now = time.time()
+    bucket = _giveaway_coin_prizes.get(message.channel.id) or []
+    # newest first
+    for _mid, amt, _raw, exp in reversed(bucket):
+        if exp >= now:
+            return int(amt)
+    return None
+
+
+def extract_giveaway_winner_ids(message):
+    """Winner user IDs from mentions (excluding the giveaway bot itself)."""
+    ids = []
+    seen = set()
+    for user in message.mentions:
+        if user.bot:
+            continue
+        if user.id == GIVEAWAY_BOT_ID:
+            continue
+        if user.id not in seen:
+            seen.add(user.id)
+            ids.append(user.id)
+    # Also scan raw mention tokens in case mentions weren't resolved
+    text = _giveaway_message_text(message)
+    for m in re.finditer(r"<@!?(\d+)>", text):
+        uid = int(m.group(1))
+        if uid == GIVEAWAY_BOT_ID or uid in seen:
+            continue
+        seen.add(uid)
+        ids.append(uid)
+    return ids
+
+
+async def handle_giveaway_coin_winners(message):
+    """If this is a Galaxy Coin giveaway win, credit each winner the stated amount."""
+    if not message.guild or message.author.id != GIVEAWAY_BOT_ID:
+        return False
+    if not is_giveaway_winner_announcement(message):
+        return False
+
+    text = _giveaway_message_text(message)
+    amount = lookup_giveaway_coin_prize(message, text)
+    if not amount:
+        return False
+
+    winner_ids = extract_giveaway_winner_ids(message)
+    if not winner_ids:
+        logger.info("Giveaway winner message had coin prize (%s) but no winner mentions", amount)
+        return False
+
+    paid = []
+    for uid in winner_ids:
+        try:
+            change_coins(message.guild.id, uid, amount)
+            paid.append(uid)
+        except Exception:
+            logger.exception("Failed to credit giveaway coins to %s", uid)
+
+    if not paid:
+        return False
+
+    mentions = ", ".join(f"<@{uid}>" for uid in paid)
+    panel = build_galaxy_embed(
+        f"🎉 Giveaway payout complete.\n\n"
+        f"**Winners:** {mentions}\n"
+        f"**Amount each:** **{amount:,}** Galaxy Coins\n"
+        f"Coins have been added to their balances automatically.",
+        title="GALAXY  /  GIVEAWAY PAYOUT",
+        color=SUCCESS_COLOR,
+        footer="GALAXY  ·  GIVEAWAY",
+    )
+    try:
+        await message.channel.send(embed=panel, allowed_mentions=discord.AllowedMentions(users=True))
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Could not post giveaway payout notice")
+
+    await send_mod_log(
+        message.guild,
+        "🎁 **Galaxy Coin giveaway payout**\n"
+        f"Channel: {message.channel.mention}\n"
+        f"Amount each: **{amount:,}**\n"
+        f"Winners: {', '.join(str(u) for u in paid)}\n"
+        f"Source message: {message.jump_url}",
+    )
+    logger.info(
+        "Paid %s galaxy coins to %s winners from giveaway in guild %s",
+        amount, len(paid), message.guild.id,
+    )
+    return True
 
 
 
@@ -2465,28 +2643,46 @@ async def on_message(message):
     if message.guild is None:
         await handle_dm_chat(message)
         return
-    if message.author.id == GIVEAWAY_BOT_ID and is_giveaway_announcement(message):
-        role = message.guild.get_role(GIVEAWAY_PING_ROLE_ID)
-        ping_text = role.mention if role else f"<@&{GIVEAWAY_PING_ROLE_ID}>"
-        announcement = discord.Embed(
-            title="GALAXY  /  NEW GIVEAWAY",
-            description=(
-                f"{ping_text} A new giveaway just started above — make sure to enter before time runs out!\n\n"
-                "May the best of luck be with you guys! 🎉"
-            ),
-            color=GALAXY_COLOR,
-            timestamp=discord.utils.utcnow(),
-        )
-        announcement.set_footer(text="GALAXY  ·  GIVEAWAY ALERTS")
+    if message.author.id == GIVEAWAY_BOT_ID:
+        # Winner / end message → auto-pay Galaxy Coins when the prize is coins
         try:
-            await message.channel.send(
-                content=ping_text,
-                embed=announcement,
-                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            if await handle_giveaway_coin_winners(message):
+                return
+        except Exception:
+            logger.exception("Giveaway coin payout handler failed")
+
+        if is_giveaway_announcement(message):
+            # Remember coin prizes from the start message so the end message can pay out
+            start_text = _giveaway_message_text(message)
+            coin_amount = parse_galaxy_coin_amount(start_text)
+            if coin_amount:
+                remember_giveaway_coin_prize(message, coin_amount, start_text[:200])
+                logger.info(
+                    "Tracked galaxy-coin giveaway prize %s in channel %s",
+                    coin_amount, message.channel.id,
+                )
+
+            role = message.guild.get_role(GIVEAWAY_PING_ROLE_ID)
+            ping_text = role.mention if role else f"<@&{GIVEAWAY_PING_ROLE_ID}>"
+            announcement = discord.Embed(
+                title="GALAXY  /  NEW GIVEAWAY",
+                description=(
+                    f"{ping_text} A new giveaway just started above — make sure to enter before time runs out!\n\n"
+                    "May the best of luck be with you guys! 🎉"
+                ),
+                color=GALAXY_COLOR,
+                timestamp=discord.utils.utcnow(),
             )
-        except (discord.Forbidden, discord.HTTPException):
-            logger.exception("Failed to send giveaway ping in channel %s", message.channel.id)
-        return
+            announcement.set_footer(text="GALAXY  ·  GIVEAWAY ALERTS")
+            try:
+                await message.channel.send(
+                    content=ping_text,
+                    embed=announcement,
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Failed to send giveaway ping in channel %s", message.channel.id)
+            return
 
     # staff application form posts into the apps channel — alert the manager team
     if (
@@ -2698,6 +2894,75 @@ async def _handle_riddle_guess(channel, author, guess_text, message=None):
         value = re.sub(r"[^a-z0-9]+", " ", value)
         return re.sub(r"\s+", " ", value).strip()
 
+    def _strip_simple_inflection(value):
+        """Singular/plural / light suffix normalization for short English answers."""
+        value = (value or "").strip()
+        if len(value) <= 2:
+            return value
+        for suffix in ("ing", "ed", "ies", "es", "s"):
+            if value.endswith(suffix) and len(value) - len(suffix) >= 3:
+                stem = value[: -len(suffix)]
+                if suffix == "ies":
+                    stem = stem + "y"
+                return stem
+        return value
+
+    def _edit_distance(a, b):
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+        # small strings only — riddle answers are short
+        if len(a) > 48 or len(b) > 48:
+            return 99
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            curr = [i]
+            for j, cb in enumerate(b, 1):
+                ins = curr[j - 1] + 1
+                delete = prev[j] + 1
+                sub = prev[j - 1] + (ca != cb)
+                curr.append(min(ins, delete, sub))
+            prev = curr
+        return prev[-1]
+
+    def _riddle_guess_matches(guess, accepted_set):
+        """Lenient match: exact, plural, containment, small typos / extra letters."""
+        if not guess:
+            return False
+        guess_c = re.sub(r"\s+", "", guess)
+        accepted_list = [a for a in accepted_set if a]
+        accepted_compact = {re.sub(r"\s+", "", a) for a in accepted_list}
+
+        if guess in accepted_set or guess_c in accepted_compact:
+            return True
+
+        guess_stem = _strip_simple_inflection(guess_c)
+        for a in accepted_list:
+            a_c = re.sub(r"\s+", "", a)
+            a_stem = _strip_simple_inflection(a_c)
+            # glove / gloves / gloving
+            if guess_stem and a_stem and guess_stem == a_stem and len(a_stem) >= 3:
+                return True
+            # extra/missing letters (typos): allow 1 edit for short, 2 for longer
+            max_edits = 1 if len(a_c) <= 5 else 2
+            if abs(len(guess_c) - len(a_c)) <= max_edits and _edit_distance(guess_c, a_c) <= max_edits:
+                return True
+            # part of the answer is present (and substantial)
+            if len(a_c) >= 4 and len(guess_c) >= 3:
+                if a_c in guess_c or guess_c in a_c:
+                    # reject tiny accidental substrings of much longer noise
+                    if min(len(a_c), len(guess_c)) >= max(3, int(0.6 * max(len(a_c), len(guess_c)))):
+                        return True
+            # multi-word: all expected tokens appear in the guess (order-free)
+            a_tokens = [t for t in a.split() if len(t) > 1]
+            g_tokens = set(guess.split())
+            if len(a_tokens) >= 2 and all(t in g_tokens or _strip_simple_inflection(t) in {_strip_simple_inflection(x) for x in g_tokens} for t in a_tokens):
+                return True
+        return False
+
     cleaned = _normalize_riddle_answer(guess_text)
     expected = _normalize_riddle_answer(active.get("answer", ""))
     # Accept common alternate phrasings / spellings for the riddles in the bank.
@@ -2735,13 +3000,19 @@ async def _handle_riddle_guess(channel, author, guess_text, message=None):
         "temperature": ["heat", "thermometer reading"],
         "secret": ["a secret"],
         "dozens": ["dozen", "12", "twelve"],
+        "glove": ["gloves", "a glove"],
+        "gloves": ["glove", "a glove"],
     }
     accepted = {_normalize_riddle_answer(expected)}
     accepted.update(_normalize_riddle_answer(x) for x in answer_aliases.get(expected, []))
-    # For number riddle, allow spacing/commas to vary (e.g. "1,2,3" or "123").
-    accepted_compact = {re.sub(r"\s+", "", x) for x in accepted}
-    cleaned_compact = re.sub(r"\s+", "", cleaned)
-    if cleaned in accepted or cleaned_compact in accepted_compact:
+    # Always allow simple plural/singular of the official answer
+    exp_c = re.sub(r"\s+", "", expected)
+    if exp_c.endswith("s") and len(exp_c) > 3:
+        accepted.add(_normalize_riddle_answer(expected.rstrip("s")))
+    else:
+        accepted.add(_normalize_riddle_answer(expected + "s"))
+
+    if _riddle_guess_matches(cleaned, accepted):
         reward = random.randint(GALAXY_QUESTION_REWARD_MIN, GALAXY_QUESTION_REWARD_MAX)
         change_coins(channel.guild.id, author.id, reward)
         active_galaxy_questions.pop(channel.guild.id, None)
