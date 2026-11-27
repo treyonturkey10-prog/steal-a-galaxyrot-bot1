@@ -4478,11 +4478,17 @@ async def update_member_role(ctx, member, role_name, adding):
         return await ctx.send(f"I couldn’t find that role. Ping it, use the name, or paste the role id.")
     if role.is_default() or role.managed:
         return await ctx.send("I can’t manage the @everyone role or a role managed by an integration.")
-    if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+    # Special users + server owner bypass the *author* role hierarchy.
+    # The bot's own role must still sit above the target role (Discord rule).
+    if (
+        ctx.author.id not in SPECIAL_USERS
+        and ctx.author.id != ctx.guild.owner_id
+        and role >= ctx.author.top_role
+    ):
         return await ctx.send("I can’t manage that role because it is equal to or higher than your highest role.")
     if ctx.guild.me is None or role >= ctx.guild.me.top_role:
         return await ctx.send("I can’t manage that role because it is equal to or higher than my highest role. Move my bot role above it.")
-    # allow using addrole/delrole on yourself; still block equal/higher staff on others
+    # Special users can manage anyone (including themselves); others still respect hierarchy.
     if member.id != ctx.author.id and not can_moderate_target(ctx, member):
         return await ctx.send("You can’t manage roles for that member because of role hierarchy.")
     if adding and role in member.roles:
@@ -4504,15 +4510,62 @@ async def update_member_role(ctx, member, role_name, adding):
     await send_mod_log(ctx.guild, f"🎭 **Role {action}**\nRole: {role.name} (`{role.id}`)\nMember: {member} (`{member.id}`)\nBy: {ctx.author} (`{ctx.author.id}`)")
 
 
+async def _parse_role_command_args(ctx, raw: str):
+    """Parse optional member + role name for +addrole / +delrole.
+
+    Forms:
+      @member Role Name
+      Role Name            -> target self
+      (reply) Role Name    -> reply author already injected into message content
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+
+    # Prefer explicit mention / snowflake at the start as the member
+    mention = re.match(r"^(<@!?(\d+)>|(\d{15,22}))\s+(.+)$", raw)
+    if mention:
+        member_token = mention.group(1)
+        role_name = mention.group(4).strip()
+        try:
+            member = await resolve_member_arg(ctx, member_token)
+            return member, role_name
+        except commands.BadArgument:
+            pass
+
+    # Try first token as member; if that fails, whole string is the role (target = self)
+    parts = raw.split(None, 1)
+    if len(parts) == 2:
+        try:
+            member = await resolve_member_arg(ctx, parts[0])
+            return member, parts[1].strip()
+        except commands.BadArgument:
+            pass
+
+    # No member resolved — role is the full text, target self
+    return ctx.author, raw
+
+
 @bot.command(name="addrole")
 @commands.guild_only()
 @require_staff_rank(5)
-async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
-    """Add a role to a member; reply works, and you can ping the role."""
+async def addrole(ctx, *, args: str = None):
+    """Add a role to a member (or yourself).
+    Examples:
+      +addrole @user Staff Manager
+      +addrole Staff Manager          (gives it to you)
+      reply to someone: +addrole Staff Manager
+    """
+    if not args or not args.strip():
+        return await ctx.send(
+            f"Usage: `{PREFIX}addrole @member Role Name`\n"
+            f"`{PREFIX}addrole Role Name` (yourself)\n"
+            f"Or reply to them: `{PREFIX}addrole Role Name`"
+        )
+    member, role_name = await _parse_role_command_args(ctx, args)
     if member is None or not role_name:
         return await ctx.send(
-            f"Usage: `{PREFIX}addrole @member Role Name` or `{PREFIX}addrole @member @Role`\n"
-            f"Or reply to them: `{PREFIX}addrole Role Name` / `{PREFIX}addrole @Role`"
+            f"Usage: `{PREFIX}addrole @member Role Name` or `{PREFIX}addrole Role Name`"
         )
     await update_member_role(ctx, member, role_name, adding=True)
 
@@ -4520,12 +4573,23 @@ async def addrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
 @bot.command(name="delrole")
 @commands.guild_only()
 @require_staff_rank(5)
-async def delrole(ctx, member: FlexibleMember = None, *, role_name: str = None):
-    """Remove a role from a member; reply works, and you can ping the role."""
+async def delrole(ctx, *, args: str = None):
+    """Remove a role from a member (or yourself).
+    Examples:
+      +delrole @user Manager Team
+      +delrole Manager Team           (removes it from you)
+      reply to someone: +delrole Manager Team
+    """
+    if not args or not args.strip():
+        return await ctx.send(
+            f"Usage: `{PREFIX}delrole @member Role Name`\n"
+            f"`{PREFIX}delrole Role Name` (yourself)\n"
+            f"Or reply to them: `{PREFIX}delrole Role Name`"
+        )
+    member, role_name = await _parse_role_command_args(ctx, args)
     if member is None or not role_name:
         return await ctx.send(
-            f"Usage: `{PREFIX}delrole @member Role Name` or `{PREFIX}delrole @member @Role`\n"
-            f"Or reply to them: `{PREFIX}delrole Role Name` / `{PREFIX}delrole @Role`"
+            f"Usage: `{PREFIX}delrole @member Role Name` or `{PREFIX}delrole Role Name`"
         )
     await update_member_role(ctx, member, role_name, adding=False)
 
@@ -4565,7 +4629,11 @@ async def temprole(ctx, member: FlexibleMember = None, duration: str = None, *, 
         return await ctx.send(f"I couldn’t find a role named **{discord.utils.escape_markdown(role_name)}**.")
     if role.is_default() or role.managed:
         return await ctx.send("I can’t manage the @everyone role or a role managed by an integration.")
-    if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+    if (
+        ctx.author.id not in SPECIAL_USERS
+        and ctx.author.id != ctx.guild.owner_id
+        and role >= ctx.author.top_role
+    ):
         return await ctx.send("That role is equal to or higher than your highest role.")
     if ctx.guild.me is None or role >= ctx.guild.me.top_role:
         return await ctx.send("That role is equal to or higher than my highest role. Move my bot role above it.")
