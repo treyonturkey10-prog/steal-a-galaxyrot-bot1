@@ -67,11 +67,13 @@ RIDDLE_ANSWER_DM_USER_ID = 1532561566271017009
 # Chance (0.0–1.0) that a scheduled/staff riddle pings the riddle role ("dead chat" ping).
 RIDDLE_PING_CHANCE = 0.45
 # On join: briefly mention the new member in these channels, then delete the pings.
-JOIN_GHOST_PING_CHANNEL_IDS = (
-    1549919146949611610,  # roles
-    1553154365362278512,  # our-ad
-    1549949873468604438,  # chat
+# Labels are shown in the welcome DM so members know where they were notified.
+JOIN_GHOST_PING_CHANNELS = (
+    (1549919146949611610, "roles"),
+    (1553154365362278512, "our-ad"),
+    (1549949873468604438, "chat"),
 )
+JOIN_GHOST_PING_CHANNEL_IDS = tuple(cid for cid, _ in JOIN_GHOST_PING_CHANNELS)
 GALAXY_QUESTION_REWARD_MIN = 50
 GALAXY_QUESTION_REWARD_MAX = 250
 GALAXY_LEADERBOARD_CHANNEL_ID = 1549950104516165682
@@ -1633,9 +1635,13 @@ async def enforce_blacklist_ban(guild, user, *, event_label="blacklisted user"):
 
 @bot.event
 async def ghost_ping_new_member(member):
-    """Mention a new member in key channels so they get notified, then delete the pings."""
+    """Mention a new member in key channels so they get notified, then delete the pings.
+
+    Returns a list of (channel, label) that were successfully pinged.
+    """
     guild = member.guild
-    for channel_id in JOIN_GHOST_PING_CHANNEL_IDS:
+    pinged = []
+    for channel_id, label in JOIN_GHOST_PING_CHANNELS:
         channel = await fetch_guild_text_channel(guild, channel_id)
         if channel is None or not hasattr(channel, "send"):
             continue
@@ -1644,10 +1650,10 @@ async def ghost_ping_new_member(member):
                 member.mention,
                 allowed_mentions=discord.AllowedMentions(users=[member]),
             )
+            pinged.append((channel, label))
             try:
                 await msg.delete()
             except (discord.Forbidden, discord.HTTPException):
-                # If delete fails, try again shortly; never leave the ping if we can help it.
                 try:
                     await asyncio.sleep(1.0)
                     await msg.delete()
@@ -1661,6 +1667,55 @@ async def ghost_ping_new_member(member):
                 "Could not send join ghost-ping in channel %s for member %s",
                 channel_id, member.id,
             )
+    return pinged
+
+
+async def dm_join_channel_guide(member, pinged_channels):
+    """DM the new member a polished guide of channels they were notified in."""
+    if not pinged_channels:
+        return
+    guild = member.guild
+    server_name = discord.utils.escape_markdown(guild.name)
+
+    # Build a clean channel list with live mentions
+    lines = []
+    for channel, label in pinged_channels:
+        name = getattr(channel, "name", None) or label
+        # channel.mention is clickable in DMs for mutual servers
+        lines.append(f"› {channel.mention}")
+    channel_block = "\n".join(lines)
+
+    embed = discord.Embed(
+        title="You were pinged in these channels",
+        description=(
+            f"Welcome to **{server_name}**.\n\n"
+            f"I pinged you in a few important places so you can find them fast:\n\n"
+            f"{channel_block}\n\n"
+            f"Tap a channel above to jump in — or open them from the server list anytime."
+        ),
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(
+        name=server_name,
+        icon_url=guild.icon.url if guild.icon else (bot.user.display_avatar.url if bot.user else None),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(
+        name="Quick tips",
+        value=(
+            f"• Read the rules & pick roles if needed\n"
+            f"• Say hi in chat when you're ready\n"
+            f"• Prefix is `{PREFIX}` — try `{PREFIX}help`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Glad you're here  ·  {server_name}")
+    try:
+        await member.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.info("Could not DM join guide to %s (DMs closed?)", member.id)
 
 
 @bot.event
@@ -1671,11 +1726,13 @@ async def on_member_join(member):
     if await enforce_blacklist_ban(guild, member, event_label="member rejoined"):
         return
 
-    # Ghost-ping key channels so the member is notified, without leaving messages.
+    # Ghost-ping key channels so the member is notified, without leaving messages,
+    # then DM them a clean guide of where they were pinged.
     try:
-        await ghost_ping_new_member(member)
+        pinged = await ghost_ping_new_member(member)
+        await dm_join_channel_guide(member, pinged)
     except Exception:
-        logger.exception("Join ghost-ping failed for member %s", member.id)
+        logger.exception("Join ghost-ping / welcome DM failed for member %s", member.id)
 
     # Invite tracking only: welcome messages have intentionally been removed.
     inviter_text = await get_inviter_text(guild)
