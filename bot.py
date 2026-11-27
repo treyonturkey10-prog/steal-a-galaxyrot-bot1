@@ -1903,10 +1903,39 @@ def _prune_channel_map(store):
         store.pop(key, None)
 
 
-def remember_deleted_message(message):
-    """Remember deleted human messages for +snipe (keeps a short history per channel)."""
+async def remember_deleted_message(message):
+    """Remember deleted human messages for +snipe (keeps a short history per channel).
+
+    If the deleted message was a reply, also remember which message it replied to.
+    """
     if not message.guild or message.author.bot:
         return
+
+    reply_info = None
+    ref = message.reference
+    if ref is not None and ref.message_id:
+        replied = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+        if replied is None:
+            replied = getattr(ref, "cached_message", None)
+        if replied is None:
+            try:
+                replied = await message.channel.fetch_message(ref.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                replied = None
+        ref_channel_id = ref.channel_id or message.channel.id
+        reply_info = {
+            "message_id": ref.message_id,
+            "jump_url": f"https://discord.com/channels/{message.guild.id}/{ref_channel_id}/{ref.message_id}",
+            "available": replied is not None,
+        }
+        if replied is not None:
+            reply_info.update({
+                "author_id": replied.author.id,
+                "author_name": str(replied.author),
+                "content": (replied.content or "").strip(),
+                "attachments": len(replied.attachments),
+            })
+
     entry = {
         "content": message.content or "",
         "author_name": str(message.author),
@@ -1917,6 +1946,7 @@ def remember_deleted_message(message):
         "attachments": [attachment.url for attachment in message.attachments[:4]],
         "channel_id": message.channel.id,
         "message_id": message.id,
+        "reply_to": reply_info,
     }
     history = sniped_messages.setdefault(message.channel.id, [])
     # Avoid duplicate ids if Discord fires delete more than once
@@ -1958,7 +1988,9 @@ def build_snipe_embed(entry, index, total):
     content = (entry.get("content") or "").strip() or (
         "*No text content (the message may have contained an attachment or embed).*"
     )
-    safe_content = discord.utils.escape_mentions(content)
+    # Keep mentions intact so they render like real pings (blue @name). Embeds never
+    # notify anyone, and the send uses AllowedMentions.none() as well.
+    safe_content = content
     if len(safe_content) > 3500:
         safe_content = safe_content[:3497] + "..."
     # Show newest as page 1 when listing from newest-first for the user
@@ -1981,6 +2013,25 @@ def build_snipe_embed(entry, index, total):
             value=discord.utils.format_dt(entry["created_at"], style="R"),
             inline=True,
         )
+    reply = entry.get("reply_to")
+    if reply:
+        if reply.get("available"):
+            quoted = (reply.get("content") or "").strip()
+            if not quoted:
+                quoted = "*No text (attachment or embed).*" if reply.get("attachments") else "*Empty message.*"
+            if len(quoted) > 400:
+                quoted = quoted[:397] + "..."
+            quoted = "\n".join(f"> {line}" for line in quoted.splitlines()) or "> *Empty message.*"
+            reply_value = (
+                f"This was a reply to <@{reply.get('author_id')}> "
+                f"([jump to message]({reply.get('jump_url')})):\n{quoted}"
+            )
+        else:
+            reply_value = (
+                "This was a reply to a message that could no longer be loaded "
+                f"(it may have been deleted). [Jump]({reply.get('jump_url')})"
+            )
+        panel.add_field(name="Replying to", value=reply_value[:1024], inline=False)
     if entry.get("attachments"):
         panel.add_field(
             name="Attachments",
@@ -1996,8 +2047,8 @@ def build_snipe_embed(entry, index, total):
 def build_editsnipe_embed(entry, index, total):
     before = entry.get("before") or "*empty*"
     after = entry.get("after") or "*empty*"
-    safe_before = discord.utils.escape_mentions(before)
-    safe_after = discord.utils.escape_mentions(after)
+    safe_before = before
+    safe_after = after
     if len(safe_before) > 900:
         safe_before = safe_before[:897] + "..."
     if len(safe_after) > 900:
@@ -2928,7 +2979,7 @@ async def on_message_delete(message):
     if message.id in cleared_message_ids:
         cleared_message_ids.discard(message.id)
         return
-    remember_deleted_message(message)
+    await remember_deleted_message(message)
 
 
 @bot.event
