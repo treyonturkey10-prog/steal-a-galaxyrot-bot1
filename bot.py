@@ -456,6 +456,22 @@ active_reminders = {}  # user_id -> list of asyncio.Task
 # Mount a volume at /data so this file survives deploys. The bot never wipes balances.
 import shutil
 
+def _safe_coin_totals(conn, where="", params=(), include_bank=False):
+    """Return (holders, total) summed in Python.
+
+    SQLite's SUM() raises "integer overflow" once balances get huge (they can
+    reach the signed 64-bit maximum), which would crash whatever called it.
+    """
+    cols = "balance, bank" if include_bank else "balance"
+    holders = total = 0
+    for row in conn.execute(f"SELECT {cols} FROM galaxy_coins {where}", params):
+        amount = sum(int(v or 0) for v in row)
+        if amount > 0:
+            holders += 1
+            total += amount
+    return holders, total
+
+
 def _sqlite_coin_total(path):
     """Return total coins stored in a db file, or -1 if the file can't be read."""
     if not path or not os.path.isfile(path):
@@ -468,9 +484,7 @@ def _sqlite_coin_total(path):
             ).fetchone()
             if not row:
                 return 0
-            total = conn.execute(
-                "SELECT COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
-            ).fetchone()[0]
+            total = _safe_coin_totals(conn, "WHERE balance > 0")[1]
             return int(total or 0)
         finally:
             conn.close()
@@ -669,9 +683,7 @@ def save_coin_backup():
 def restore_coins_from_backup_if_empty():
     """If the live DB has no coins at all (wallet + bank), reload from a JSON backup."""
     try:
-        live = db.execute(
-            "SELECT COALESCE(SUM(balance + bank), 0) FROM galaxy_coins WHERE balance > 0 OR bank > 0"
-        ).fetchone()[0]
+        live = _safe_coin_totals(db, "WHERE balance > 0 OR bank > 0", include_bank=True)[1]
         if int(live or 0) > 0:
             return False
         best = None
@@ -1747,9 +1759,7 @@ async def on_ready():
     logger.info("Startup diagnostics: discord.py=%s | database=%s | prefix=%r",
                 getattr(discord, "__version__", "unknown"), DATABASE_PATH, PREFIX)
     try:
-        holders = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
-        ).fetchone()
+        holders = _safe_coin_totals(db, "WHERE balance > 0")
         logger.info(
             "Galaxy coins intact: %s players holding %s total coins (db=%s)",
             int(holders[0] or 0),
@@ -3587,11 +3597,7 @@ def build_coin_leaderboard(guild, viewer_id=None):
         (guild.id,),
     ).fetchall()
 
-    totals = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins "
-        "WHERE guild_id=? AND balance > 0",
-        (guild.id,),
-    ).fetchone()
+    totals = _safe_coin_totals(db, "WHERE guild_id=? AND balance > 0", (guild.id,))
     holders = int(totals[0] or 0)
     total_coins = int(totals[1] or 0)
 
@@ -4288,6 +4294,19 @@ def require_coowner_role():
 @commands.guild_only()
 @require_coowner_role()
 async def galaxy_reset_coins(ctx, target: str = None, *, extra: str = ""):
+    """Reset wallet + bank to 0 (Co-Owner+ only). Shows the real error if something breaks."""
+    try:
+        await _reset_coins_impl(ctx, target, extra)
+    except Exception as exc:
+        logger.exception("resetcoins failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        await ctx.send(f"Reset failed: `{type(exc).__name__}: {str(exc)[:300]}`")
+
+
+async def _reset_coins_impl(ctx, target, extra):
     """Reset wallet + bank to 0.
     +resetcoins @user
     +resetcoins all confirm   (everyone in this server)
@@ -4305,11 +4324,8 @@ async def galaxy_reset_coins(ctx, target: str = None, *, extra: str = ""):
                 f"If you're sure, run `{PREFIX}resetcoins all confirm`.",
                 title="GALAXY  /  CONFIRM RESET", color=WARN_COLOR, footer="GALAXY  ·  COINS",
             ))
-        holders, total = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(balance + bank), 0) FROM galaxy_coins "
-            "WHERE guild_id=? AND (balance > 0 OR bank > 0)",
-            (ctx.guild.id,),
-        ).fetchone()
+        holders, total = _safe_coin_totals(
+            db, "WHERE guild_id=? AND (balance > 0 OR bank > 0)", (ctx.guild.id,), include_bank=True)
         db.execute("UPDATE galaxy_coins SET balance=0, bank=0 WHERE guild_id=?", (ctx.guild.id,))
         db.execute("DELETE FROM rob_log WHERE guild_id=?", (ctx.guild.id,))
         db.commit()
@@ -6157,9 +6173,7 @@ async def botinfo(ctx):
     coin_holders = 0
     coin_total = 0
     try:
-        row = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
-        ).fetchone()
+        row = _safe_coin_totals(db, "WHERE balance > 0")
         coin_holders = int(row[0] or 0)
         coin_total = int(row[1] or 0)
     except Exception:
