@@ -1651,6 +1651,8 @@ async def on_ready():
         bot.galaxy_game_task = asyncio.create_task(galaxy_game_scheduler())
     if not getattr(bot, "galaxy_leaderboard_task", None) or bot.galaxy_leaderboard_task.done():
         bot.galaxy_leaderboard_task = asyncio.create_task(galaxy_leaderboard_scheduler())
+    if not getattr(bot, "auto_code_task", None) or bot.auto_code_task.done():
+        bot.auto_code_task = asyncio.create_task(auto_code_scheduler())
 
 
 @bot.event
@@ -2905,13 +2907,19 @@ async def on_message(message):
     if active_code:
         if time.time() > active_code["expires_at"]:
             active_codes.pop(message.guild.id, None)
-        elif (
-            message.channel.id == active_code["channel_id"]
-            and message.content.strip().upper() == active_code["code"]
-        ):
-            active_codes.pop(message.guild.id, None)  # pop before any await: first person wins
-            await _award_code_claim(message, active_code)
-            return
+        elif message.channel.id == active_code["channel_id"]:
+            typed = message.content.strip().upper()
+            if typed == active_code["code"]:
+                active_codes.pop(message.guild.id, None)  # pop before any await: first person wins
+                await _award_code_claim(message, active_code)
+                return
+            if typed != active_code["code"] and _strip_invisible(typed) == active_code["code"]:
+                # Copy-pasted from the panel (hidden characters came along): not a valid claim.
+                try:
+                    await message.add_reaction("❌")
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    pass
+                return
     # Never run content filtering against commands. This keeps command messages
     # (including +sanctions) from being intercepted by the chat-content filter.
     if not message.content.startswith(PREFIX):
@@ -6063,14 +6071,29 @@ async def remind(ctx, duration: str = None, *, text: str = None):
 
 
 # ---------------------------------------------------------------------------
-# GAMES: +code (first to type the code wins coins) is Assistant Staff Manager
+# GAMES: +code (first to type the code wins coins) is Trial Director
 # and above ONLY, by ROLE. Discord Administrator permission, server ownership
 # and lower staff roles (Head Admin and below) do NOT grant access.
-# +poker (1v1 card game) is open to everyone.
+# +poker (5-card draw card game, 2-5 players) is open to everyone.
 # ---------------------------------------------------------------------------
 def require_asm_plus():
     async def predicate(ctx):
         return ctx.guild is not None and can_start_riddles(ctx.author)
+    return commands.check(predicate)
+
+
+# +code: Trial Director and above ONLY, by role (Head Director is above Trial Director,
+# so it is included). Discord Administrator permission does not bypass this.
+CODE_COMMAND_ROLE_IDS = {
+    ROLE_IDS["trial_director"], ROLE_IDS["head_director"],
+    ROLE_IDS["senior_drc"], ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
+    ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"],
+}
+
+
+def require_director_plus():
+    async def predicate(ctx):
+        return ctx.guild is not None and bool(member_role_ids(ctx.author) & CODE_COMMAND_ROLE_IDS)
     return commands.check(predicate)
 
 
@@ -6122,9 +6145,94 @@ async def _award_code_claim(message, active):
     )
 
 
+# Invisible characters hidden inside the displayed code. They are copied along with
+# the code, so a pasted code no longer matches and has to be typed by hand.
+CODE_INVISIBLE_CHARS = ("\u200b", "\u200c", "\u200d", "\u2060")
+
+
+def _anti_paste_code(code):
+    """The code as shown to members: looks normal, but pasting it won't work."""
+    return "".join(ch + random.choice(CODE_INVISIBLE_CHARS) for ch in code)
+
+
+def _strip_invisible(text):
+    for ch in CODE_INVISIBLE_CHARS:
+        text = text.replace(ch, "")
+    return text
+
+
+AUTO_CODE_CHANNEL_ID = 1575961199047348366   # channel where the bot drops codes by itself
+AUTO_CODE_MIN = 1                            # smallest automatic reward (coins)
+AUTO_CODE_MAX = 50_000_000_000               # biggest automatic reward: 50b coins
+AUTO_CODE_INTERVAL_SECONDS = 60 * 60         # auto-drop if no code was dropped for this long
+last_code_drop_at = {}                       # guild_id -> time of the latest drop (command or automatic)
+
+
+async def _send_code_drop(channel, reward, starter_id, starter_label):
+    """Post a code drop in `channel` and start tracking it. Used by +code and the auto drops."""
+    guild = channel.guild
+    code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
+    panel = build_galaxy_embed(
+        f"First person to type this code in chat wins **{reward:,} Galaxy Coins**!\n\n"
+        f"# `{_anti_paste_code(code)}`\n\n"
+        f"You have to **type it out** — copy and paste won't work.\n"
+        f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
+        title="GALAXY  /  CODE DROP", color=GALAXY_ACCENT, footer="GALAXY  ·  CODE DROP",
+    )
+    # Only sometimes ping the role, so drops don't ping every single time.
+    if random.random() < CODE_PING_CHANCE:
+        sent = await channel.send(
+            content=f"<@&{CODE_PING_ROLE_ID}>",
+            embed=panel,
+            allowed_mentions=discord.AllowedMentions(
+                roles=[discord.Object(id=CODE_PING_ROLE_ID)], users=False, everyone=False),
+        )
+    else:
+        sent = await channel.send(embed=panel, allowed_mentions=discord.AllowedMentions.none())
+    now = time.time()
+    active_codes[guild.id] = {
+        "code": code, "amount": reward, "channel_id": channel.id,
+        "message_id": sent.id, "starter_id": starter_id, "expires_at": now + CODE_EXPIRE_SECONDS,
+    }
+    last_code_drop_at[guild.id] = now
+    await send_mod_log(
+        guild,
+        f"🎟️ **Code dropped**\nBy: {starter_label}\nChannel: {channel.mention}\nReward: {reward:,}",
+    )
+    return sent
+
+
+async def auto_code_scheduler():
+    """If nobody has dropped a code for a while, drop one by itself in the code channel."""
+    await bot.wait_until_ready()
+    # Start the clock at boot so a restart never fires a code instantly.
+    for guild in bot.guilds:
+        last_code_drop_at.setdefault(guild.id, time.time())
+    while not bot.is_closed():
+        await asyncio.sleep(30)
+        try:
+            for guild in bot.guilds:
+                channel = guild.get_channel(AUTO_CODE_CHANNEL_ID)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                now = time.time()
+                last = last_code_drop_at.setdefault(guild.id, now)
+                current = active_codes.get(guild.id)
+                if current and now < current["expires_at"]:
+                    continue  # a code is still live
+                if now - last < AUTO_CODE_INTERVAL_SECONDS:
+                    continue  # someone dropped one recently (command or automatic)
+                reward = random.randint(AUTO_CODE_MIN, AUTO_CODE_MAX)
+                await _send_code_drop(channel, reward, bot.user.id, "automatic drop (bot)")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Automatic code drop failed")
+
+
 @bot.command(name="code", aliases=["dropcode", "coincode"])
 @commands.guild_only()
-@require_asm_plus()
+@require_director_plus()
 async def code_cmd(ctx, amount: str = None):
     """Drop a code in this channel. First person to type it wins coins. +code [amount]"""
     current = active_codes.get(ctx.guild.id)
@@ -6143,32 +6251,7 @@ async def code_cmd(ctx, amount: str = None):
         if not 1 <= reward <= MAX_CODE_REWARD:
             return await ctx.send(f"The reward must be between **1** and **{MAX_CODE_REWARD:,}** coins.")
 
-    code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
-    expires_at = time.time() + CODE_EXPIRE_SECONDS
-    panel = build_galaxy_embed(
-        f"First person to type this code in chat wins **{reward:,} Galaxy Coins**!\n\n"
-        f"# `{code}`\n\n"
-        f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
-        title="GALAXY  /  CODE DROP", color=GALAXY_ACCENT, footer="GALAXY  ·  CODE DROP",
-    )
-    # Only sometimes ping the role, so drops don't ping every single time.
-    if random.random() < CODE_PING_CHANCE:
-        sent = await ctx.send(
-            content=f"<@&{CODE_PING_ROLE_ID}>",
-            embed=panel,
-            allowed_mentions=discord.AllowedMentions(
-                roles=[discord.Object(id=CODE_PING_ROLE_ID)], users=False, everyone=False),
-        )
-    else:
-        sent = await ctx.send(embed=panel, allowed_mentions=discord.AllowedMentions.none())
-    active_codes[ctx.guild.id] = {
-        "code": code, "amount": reward, "channel_id": ctx.channel.id,
-        "message_id": sent.id, "starter_id": ctx.author.id, "expires_at": expires_at,
-    }
-    await send_mod_log(
-        ctx.guild,
-        f"🎟️ **Code dropped**\nBy: {ctx.author} (`{ctx.author.id}`)\nChannel: {ctx.channel.mention}\nReward: {reward:,}",
-    )
+    await _send_code_drop(ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)")
 
 
 # ----------------------------- 1v1 POKER -----------------------------------
@@ -6232,16 +6315,19 @@ def poker_hand_name(cards):
     return POKER_HAND_NAMES[score[0]]
 
 
+MAX_POKER_PLAYERS = 5  # host + up to 4 invited (5 cards + up to 5 draws each still fits a 52-card deck)
+
+
 class PokerGame:
     def __init__(self, guild, players, amount):
         self.guild = guild
-        self.players = players            # (member, member)
+        self.players = list(players)      # members who accepted and paid the ante
         self.amount = amount
-        self.pot = amount * 2
+        self.pot = amount * len(self.players)
         deck = [(r, s) for r in range(2, 15) for s in range(4)]
         random.shuffle(deck)
         self.deck = deck
-        self.hands = {p.id: [self.deck.pop() for _ in range(5)] for p in players}
+        self.hands = {p.id: [self.deck.pop() for _ in range(5)] for p in self.players}
         self.locked = set()
         self.finished = False
         self.message = None
@@ -6257,8 +6343,8 @@ class PokerGame:
             state = "✅ locked in" if p.id in self.locked else "⏳ choosing cards"
             lines.append(f"{p.mention} — {state}")
         return build_galaxy_embed(
-            f"**1v1 Poker · 5-card draw**\nPot: **{self.pot:,}** Galaxy Coins "
-            f"(**{self.amount:,}** each)\n\n" + "\n".join(lines) +
+            f"**Poker · 5-card draw · {len(self.players)} players**\n"
+            f"Pot: **{self.pot:,}** Galaxy Coins (**{self.amount:,}** each)\n\n" + "\n".join(lines) +
             "\n\nPress **View Hand / Draw** to see your cards privately and swap any of them once.",
             title="GALAXY  /  POKER DUEL", color=GALAXY_ACCENT, footer="GALAXY  ·  CASINO",
         )
@@ -6296,30 +6382,48 @@ class PokerGame:
         self.finished = True
         if self.watch_task and self.watch_task is not asyncio.current_task():
             self.watch_task.cancel()
-        a, b = self.players
-        score_a = evaluate_poker_hand(self.hands[a.id])
-        score_b = evaluate_poker_hand(self.hands[b.id])
+
+        scores = {p.id: evaluate_poker_hand(self.hands[p.id]) for p in self.players}
+        best = max(scores.values())
+        winners = [p for p in self.players if scores[p.id] == best]
+        # Work out every payout first, then pay them one by one.
+        if len(winners) == 1:
+            payouts = {winners[0].id: self.pot}
+            result = f"🏆 {winners[0].mention} wins the pot of **{self.pot:,}** Galaxy Coins!"
+            color = SUCCESS_COLOR
+        else:
+            share, extra = divmod(self.pot, len(winners))
+            payouts = {w.id: share + (extra if i == 0 else 0) for i, w in enumerate(winners)}
+            result = (
+                f"🤝 **Tie!** {', '.join(w.mention for w in winners)} split the pot of "
+                f"**{self.pot:,}** coins (**{share:,}** each)."
+            )
+            color = WARN_COLOR
+
+        paid = set()
         try:
-            if score_a == score_b:
-                change_coins(self.guild.id, a.id, self.amount)
-                change_coins(self.guild.id, b.id, self.amount)
-                result = f"🤝 **It's a tie!** Both players get their **{self.amount:,}** coins back."
-                color, winner = WARN_COLOR, None
-            else:
-                winner = a if score_a > score_b else b
-                change_coins(self.guild.id, winner.id, self.pot)
-                result = f"🏆 {winner.mention} wins the pot of **{self.pot:,}** Galaxy Coins!"
-                color = SUCCESS_COLOR
+            for uid, amount in payouts.items():
+                change_coins(self.guild.id, uid, amount)
+                paid.add(uid)
         except Exception:
             logger.exception("Poker payout failed")
-            # Best-effort: return both stakes.
-            for p in self.players:
-                try:
-                    change_coins(self.guild.id, p.id, self.amount)
-                except Exception:
-                    logger.exception("Poker fallback refund failed for %s", p.id)
-            result = "⚠️ A database error happened, so both stakes were refunded."
-            color, winner = WARN_COLOR, None
+            if not paid:
+                # Nothing was paid yet, so safely return every stake.
+                for p in self.players:
+                    try:
+                        change_coins(self.guild.id, p.id, self.amount)
+                    except Exception:
+                        logger.exception("Poker fallback refund failed for %s", p.id)
+                result = "⚠️ A database error happened, so every stake was refunded."
+                color = WARN_COLOR
+            else:
+                # Some winners were already paid, so just retry the unpaid ones.
+                for uid, amount in payouts.items():
+                    if uid not in paid:
+                        try:
+                            change_coins(self.guild.id, uid, amount)
+                        except Exception:
+                            logger.exception("Poker payout retry failed for %s", uid)
         finally:
             self.release()
 
@@ -6343,8 +6447,10 @@ class PokerGame:
                     pass
         await send_mod_log(
             self.guild,
-            f"🃏 **Poker duel finished**\n{a} (`{a.id}`) vs {b} (`{b.id}`)\nStake: {self.amount:,} each"
-            f"\nResult: {'tie' if winner is None else f'{winner} won {self.pot:,}'}",
+            f"🃏 **Poker duel finished**\nPlayers: " + ", ".join(f"{p} (`{p.id}`)" for p in self.players) +
+            f"\nStake: {self.amount:,} each · Pot: {self.pot:,}"
+            f"\nResult: " + ("tie between " if len(winners) > 1 else "winner: ") +
+            ", ".join(f"{w} (`{w.id}`)" for w in winners),
         )
 
 
@@ -6380,7 +6486,7 @@ class PokerDrawView(discord.ui.View):
         hand = self.game.hands[self.user_id]
         text = f"{_hand_text(hand)}\n**{poker_hand_name(hand)}**\n\n"
         if final:
-            text += "You're locked in. Waiting for the other player..." if not self.game.finished else "Game over."
+            text += "You're locked in. Waiting for the other players..." if not self.game.finished else "Game over."
         else:
             text += "Tap cards to mark them for discard (they turn red), then press the green button."
         return build_galaxy_embed(
@@ -6410,7 +6516,7 @@ class PokerDrawView(discord.ui.View):
         self.stop()
         if not ok:
             return
-        if len(game.locked) == 2:
+        if len(game.locked) == len(game.players):
             await game.finish()
         else:
             await game.refresh()
@@ -6437,139 +6543,223 @@ class PokerTableView(discord.ui.View):
 
 
 class PokerChallengeView(discord.ui.View):
-    def __init__(self, guild, challenger, opponent, amount):
+    """Lobby: every invited player is pinged and chooses Accept or Decline."""
+
+    def __init__(self, guild, host, invited, amount):
         super().__init__(timeout=60)
         self.guild = guild
-        self.challenger = challenger
-        self.opponent = opponent
+        self.host = host
+        self.invited = list(invited)
         self.amount = amount
+        self.responses = {m.id: None for m in self.invited}  # None = waiting, True = accepted, False = declined
         self.message = None
         self.resolved = False
 
-    def _release(self):
-        poker_busy.discard((self.guild.id, self.challenger.id))
-        poker_busy.discard((self.guild.id, self.opponent.id))
+    def _release_all(self):
+        poker_busy.discard((self.guild.id, self.host.id))
+        for m in self.invited:
+            poker_busy.discard((self.guild.id, m.id))
+
+    def lobby_embed(self):
+        lines = []
+        for m in self.invited:
+            state = self.responses[m.id]
+            label = "⏳ waiting" if state is None else ("✅ accepted" if state else "❌ declined")
+            lines.append(f"• {m.mention} — {label}")
+        return build_galaxy_embed(
+            f"{self.host.mention} invited you to a **Poker** duel!\n\n"
+            f"**Ante:** {self.amount:,} each · **Pot:** {self.amount:,} × the number of players\n"
+            "5-card draw: everyone gets 5 cards, swaps any of them once, and the best hand wins the pot.\n\n"
+            + "\n".join(lines) +
+            "\n\nInvited players, press **Accept** or **Decline** within 60 seconds. "
+            f"{self.host.mention} can press **Start Now** once at least one person has accepted.",
+            title="GALAXY  /  POKER DUEL", color=GALAXY_ACCENT, footer="GALAXY  ·  CASINO",
+        )
+
+    async def _swap(self, interaction, embed, view=None):
+        """Edit the lobby message, using the interaction when we have one."""
+        if interaction is not None:
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+        elif self.message is not None:
+            try:
+                await self.message.edit(content=None, embed=embed, view=view)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def _cancel(self, interaction, text, color=None):
+        self.resolved = True
+        self.stop()
+        self._release_all()
+        await self._swap(interaction, build_galaxy_embed(
+            text, title="GALAXY  /  POKER DUEL", color=color or GALAXY_COLOR, footer="GALAXY  ·  CASINO"))
+
+    async def _begin(self, interaction=None):
+        """Take the antes from the host and everyone who accepted, then deal."""
+        self.resolved = True
+        self.stop()
+        gid, amount = self.guild.id, self.amount
+        accepted = [m for m in self.invited if self.responses[m.id]]
+        charged = []
+        try:
+            ok, _ = spend_coins(gid, self.host.id, amount)
+            if not ok:
+                self._release_all()
+                return await self._swap(interaction, build_galaxy_embed(
+                    f"{self.host.mention} no longer has enough coins. Duel cancelled.",
+                    title="GALAXY  /  POKER DUEL", color=ERROR_COLOR, footer="GALAXY  ·  CASINO"))
+            charged.append(self.host)
+            for m in accepted:
+                ok, _ = spend_coins(gid, m.id, amount)
+                if ok:
+                    charged.append(m)
+        except Exception:
+            logger.exception("Poker escrow failed")
+            for m in charged:
+                try:
+                    change_coins(gid, m.id, amount)
+                except Exception:
+                    logger.exception("Poker escrow refund failed for %s", m.id)
+            self._release_all()
+            return await self._swap(interaction, build_galaxy_embed(
+                "Couldn't safely take the stakes, so the duel was cancelled.",
+                title="GALAXY  /  POKER DUEL", color=ERROR_COLOR, footer="GALAXY  ·  CASINO"))
+
+        if len(charged) < 2:
+            for m in charged:
+                change_coins(gid, m.id, amount)  # give the host their ante back
+            self._release_all()
+            return await self._swap(interaction, build_galaxy_embed(
+                "Not enough players joined (or the others couldn't afford the ante), so the duel was cancelled.",
+                title="GALAXY  /  POKER DUEL", color=GALAXY_COLOR, footer="GALAXY  ·  CASINO"))
+
+        # Anyone invited who isn't playing (declined, no answer, too poor) is free again.
+        playing = {m.id for m in charged}
+        for m in [self.host] + self.invited:
+            if m.id not in playing:
+                poker_busy.discard((gid, m.id))
+
+        game = PokerGame(self.guild, charged, amount)
+        await self._swap(interaction, game.status_embed(), PokerTableView(game))
+        game.message = interaction.message if interaction is not None else self.message
+        game.watch_task = asyncio.create_task(game.watch())
+
+    async def _after_response(self, interaction):
+        if all(v is not None for v in self.responses.values()):
+            if any(self.responses.values()):
+                return await self._begin(interaction)
+            return await self._cancel(interaction, "Everyone declined the poker duel.")
+        await interaction.response.edit_message(embed=self.lobby_embed(), view=self)
 
     async def interaction_check(self, interaction: discord.Interaction):
-        if interaction.user.id not in (self.challenger.id, self.opponent.id):
-            await interaction.response.send_message("This challenge isn't for you.", ephemeral=True)
+        if interaction.user.id != self.host.id and interaction.user.id not in self.responses:
+            await interaction.response.send_message("This poker duel isn't for you.", ephemeral=True)
             return False
         return True
 
     async def on_timeout(self):
         if self.resolved:
             return
-        self.resolved = True
-        self._release()
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    embed=build_galaxy_embed(
-                        "The challenge expired with no answer.",
-                        title="GALAXY  /  POKER DUEL", color=GALAXY_COLOR, footer="GALAXY  ·  CASINO"),
-                    view=None, content=None)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        try:
+            if any(self.responses.values()):
+                await self._begin(None)  # start with whoever accepted
+            else:
+                await self._cancel(None, "Nobody accepted in time, so the poker duel expired.")
+        except Exception:
+            logger.exception("Poker lobby timeout failed")
+            self._release_all()
 
     @discord.ui.button(label="Accept", emoji="✅", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.opponent.id:
-            return await interaction.response.send_message(
-                "Only the challenged player can accept.", ephemeral=True)
+        uid = interaction.user.id
+        if uid not in self.responses:
+            return await interaction.response.send_message("Only invited players can accept.", ephemeral=True)
         if self.resolved:
-            return await interaction.response.send_message("This challenge is no longer active.", ephemeral=True)
-        self.resolved = True
-        self.stop()
-        gid, amount = self.guild.id, self.amount
-        try:
-            ok1, _ = spend_coins(gid, self.challenger.id, amount)
-            if not ok1:
-                self._release()
-                return await interaction.response.edit_message(
-                    content=None, view=None,
-                    embed=build_galaxy_embed(
-                        f"{self.challenger.mention} no longer has enough coins. Duel cancelled.",
-                        title="GALAXY  /  POKER DUEL", color=ERROR_COLOR, footer="GALAXY  ·  CASINO"))
-            ok2, _ = spend_coins(gid, self.opponent.id, amount)
-            if not ok2:
-                change_coins(gid, self.challenger.id, amount)  # refund the challenger
-                self._release()
-                return await interaction.response.edit_message(
-                    content=None, view=None,
-                    embed=build_galaxy_embed(
-                        f"{self.opponent.mention} doesn't have enough coins. Duel cancelled.",
-                        title="GALAXY  /  POKER DUEL", color=ERROR_COLOR, footer="GALAXY  ·  CASINO"))
-        except Exception:
-            logger.exception("Poker escrow failed")
-            self._release()
-            return await interaction.response.edit_message(
-                content=None, view=None,
-                embed=build_galaxy_embed(
-                    "Couldn't safely take the stakes, so the duel was cancelled.",
-                    title="GALAXY  /  POKER DUEL", color=ERROR_COLOR, footer="GALAXY  ·  CASINO"))
-
-        game = PokerGame(self.guild, (self.challenger, self.opponent), amount)
-        await interaction.response.edit_message(content=None, embed=game.status_embed(), view=PokerTableView(game))
-        game.message = interaction.message
-        game.watch_task = asyncio.create_task(game.watch())
+            return await interaction.response.send_message("This duel is no longer active.", ephemeral=True)
+        if self.responses[uid] is not None:
+            return await interaction.response.send_message("You already answered.", ephemeral=True)
+        self.responses[uid] = True
+        await self._after_response(interaction)
 
     @discord.ui.button(label="Decline", emoji="✖️", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if uid not in self.responses:
+            return await interaction.response.send_message("Only invited players can decline.", ephemeral=True)
         if self.resolved:
-            return await interaction.response.send_message("This challenge is no longer active.", ephemeral=True)
-        self.resolved = True
-        self.stop()
-        self._release()
-        who = "declined" if interaction.user.id == self.opponent.id else "cancelled"
-        await interaction.response.edit_message(
-            content=None, view=None,
-            embed=build_galaxy_embed(
-                f"{interaction.user.mention} {who} the poker duel.",
-                title="GALAXY  /  POKER DUEL", color=GALAXY_COLOR, footer="GALAXY  ·  CASINO"))
+            return await interaction.response.send_message("This duel is no longer active.", ephemeral=True)
+        if self.responses[uid] is not None:
+            return await interaction.response.send_message("You already answered.", ephemeral=True)
+        self.responses[uid] = False
+        await self._after_response(interaction)
+
+    @discord.ui.button(label="Start Now", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def start_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.host.id:
+            return await interaction.response.send_message("Only the host can start the duel.", ephemeral=True)
+        if self.resolved:
+            return await interaction.response.send_message("This duel is no longer active.", ephemeral=True)
+        if not any(self.responses.values()):
+            return await interaction.response.send_message("Nobody has accepted yet.", ephemeral=True)
+        await self._begin(interaction)
+
+    @discord.ui.button(label="Cancel Duel", emoji="🛑", style=discord.ButtonStyle.secondary)
+    async def cancel_duel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.host.id:
+            return await interaction.response.send_message("Only the host can cancel the duel.", ephemeral=True)
+        if self.resolved:
+            return await interaction.response.send_message("This duel is no longer active.", ephemeral=True)
+        await self._cancel(interaction, f"{self.host.mention} cancelled the poker duel.")
 
 
 @bot.command(name="poker", aliases=["pokerduel", "1v1"])
 @commands.guild_only()
-async def poker_cmd(ctx, member: discord.Member, amount: str):
-    """Challenge someone to 1v1 5-card draw poker for coins. +poker @user <amount>"""
-    if member.bot or member.id == ctx.author.id:
-        return await ctx.send("Pick another real member to duel.")
+async def poker_cmd(ctx, member: commands.Greedy[discord.Member], amount: str):
+    """Invite one or more people to 5-card draw poker for coins. +poker @a [@b ...] <amount>"""
+    # `member` is the parameter name on purpose: replying to someone with the command still targets them.
+    invited, seen = [], {ctx.author.id}
+    for m in member:
+        if m.bot or m.id in seen:
+            continue
+        seen.add(m.id)
+        invited.append(m)
+    if not invited:
+        return await ctx.send(
+            f"Mention at least one real member to play against, e.g. `{PREFIX}poker @user 500` "
+            f"or `{PREFIX}poker @user1 @user2 500`.")
+    if len(invited) > MAX_POKER_PLAYERS - 1:
+        return await ctx.send(
+            f"A poker game can have at most **{MAX_POKER_PLAYERS} players** (you plus {MAX_POKER_PLAYERS - 1}).")
     try:
         stake = parse_coin_amount(amount, current_balance=get_coin_balance(ctx.guild.id, ctx.author.id))
     except ValueError:
         return await ctx.send(f"Enter a valid amount, e.g. `{PREFIX}poker @user 500`.")
     if stake < 1:
         return await ctx.send("The minimum ante is **1 Galaxy Coin**.")
-    for person in (ctx.author, member):
+    for person in [ctx.author] + invited:
         if (ctx.guild.id, person.id) in poker_busy:
             return await ctx.send(f"{person.display_name} is already in a poker duel.",
                                   allowed_mentions=discord.AllowedMentions.none())
     mine = get_coin_balance(ctx.guild.id, ctx.author.id)
-    theirs = get_coin_balance(ctx.guild.id, member.id)
     if mine < stake:
         return await ctx.send(f"You only have **{mine:,} Galaxy Coins**.")
-    if theirs < stake:
+    broke = [m for m in invited if get_coin_balance(ctx.guild.id, m.id) < stake]
+    if broke:
         return await ctx.send(
-            f"{member.display_name} only has **{theirs:,} Galaxy Coins**, so they can't match that ante.",
+            "These players can't match that ante: " + ", ".join(m.display_name for m in broke) + ".",
             allowed_mentions=discord.AllowedMentions.none())
 
     poker_busy.add((ctx.guild.id, ctx.author.id))
-    poker_busy.add((ctx.guild.id, member.id))
-    view = PokerChallengeView(ctx.guild, ctx.author, member, stake)
-    panel = build_galaxy_embed(
-        f"{ctx.author.mention} challenged {member.mention} to a **1v1 Poker** duel!\n\n"
-        f"**Ante:** {stake:,} each · **Pot:** {stake * 2:,}\n"
-        "5-card draw: you each get 5 cards, swap any of them once, and the best hand wins the pot.\n\n"
-        f"{member.mention}, press **Accept** within 60 seconds.",
-        title="GALAXY  /  POKER DUEL", color=GALAXY_ACCENT, footer="GALAXY  ·  CASINO",
-    )
+    for m in invited:
+        poker_busy.add((ctx.guild.id, m.id))
+    view = PokerChallengeView(ctx.guild, ctx.author, invited, stake)
     try:
         view.message = await ctx.send(
-            content=member.mention, embed=panel, view=view,
-            allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+            content=" ".join(m.mention for m in invited),  # pings every invited player
+            embed=view.lobby_embed(), view=view,
+            allowed_mentions=discord.AllowedMentions(users=invited, roles=False, everyone=False),
         )
     except Exception:
-        view._release()
+        view._release_all()
         raise
 
 
@@ -6678,8 +6868,8 @@ async def help(ctx):
     embed.add_field(
         name="CODE DROPS & POKER",
         value=(
-            f"`{PREFIX}code [amount]` (Assistant Staff Manager+) — drops a code; first person to type it wins coins.\n"
-            f"`{PREFIX}poker @user <amount>` (everyone) — 1v1 5-card draw poker for coins."
+            f"`{PREFIX}code [amount]` (Trial Director+) — drops a code; first person to type it wins coins.\n"
+            f"`{PREFIX}poker @user [@user2 ...] <amount>` (everyone) — 5-card draw poker for coins; everyone invited gets pinged and chooses Accept or Decline."
         ),
         inline=False,
     )
