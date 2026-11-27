@@ -116,7 +116,9 @@ MEMBER_ROLE_ID = 1549925555736936468
 MEMBER_ALLOWED_COMMANDS = {
     "balance", "bal", "coins", "leaderboard", "topcoins", "richest",
     "daily", "gamble", "coinflip", "cf", "slots", "dice", "roll", "givecoins", "paycoins",
-    "tipcoins", "tradecoins", "trade", "avatar", "userinfo", "riddle",
+    "tipcoins", "tradecoins", "trade", "avatar", "userinfo", "whois", "riddle",
+    "snipe", "editsnipe", "poll", "remind", "remindme", "botinfo", "uptime",
+    "membercount", "mc", "help", "ping",
 }
 
 # Restored from the previous Galaxy Bot word/scam filter. Perm 5+ staff are exempt.
@@ -337,6 +339,8 @@ bot = commands.Bot(
     cls=GalaxyContext,
     allowed_mentions=discord.AllowedMentions.none(),
 )
+BOT_STARTED_AT = time.time()
+active_reminders = {}  # user_id -> list of asyncio.Task
 # Coins live in sqlite at /data/raiders.sqlite3 (hardcoded for Railway volumes).
 # Mount a volume at /data so this file survives deploys. The bot never wipes balances.
 import shutil
@@ -414,7 +418,7 @@ if (
         logger.exception("Failed to restore coin database from %s", _best_path)
         DATABASE_PATH = _best_path
 
-db = sqlite3.connect(DATABASE_PATH, timeout=30)
+db = sqlite3.connect(DATABASE_PATH, timeout=30, check_same_thread=False)
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA synchronous=FULL")
 db.execute("PRAGMA foreign_keys=ON")
@@ -607,8 +611,13 @@ recent_joins = {}
 invite_cache = {}
 active_galaxy_questions = {}  # guild_id -> active question dictionary
 # Most recently deleted messages, kept separately for each text channel.
+# channel_id -> list of deleted message snapshots (newest last)
 sniped_messages = {}
+# channel_id -> list of edited message snapshots (newest last)
+edited_messages = {}
 cleared_message_ids = set()
+MAX_SNIPE_CHANNELS = 200
+MAX_SNIPE_HISTORY = 15  # how many deletions/edits to keep per channel for arrow navigation
 # Active temp roles: (guild_id, user_id, role_id) -> asyncio.Task
 temp_role_tasks = {}
 # Active VC mute/deafen timers: (guild_id, user_id, "mute"|"deafen") -> asyncio.Task
@@ -1302,6 +1311,33 @@ async def on_member_join(member):
 
 
 @bot.event
+async def on_member_ban(guild, user):
+    """Log bans that happen outside the bot (Discord UI, other bots, etc.)."""
+    # Bot-issued bans are already logged by the command; this catches the rest.
+    try:
+        entry = None
+        async for e in guild.audit_logs(limit=6, action=discord.AuditLogAction.ban):
+            if e.target and e.target.id == user.id:
+                entry = e
+                break
+        if entry and bot.user and entry.user and entry.user.id == bot.user.id:
+            return  # already logged by +ban / +softban / +bl
+        who = f"{entry.user} (`{entry.user.id}`)" if entry and entry.user else "Unknown"
+        why = entry.reason if entry and entry.reason else "No reason in audit log"
+        await send_mod_log(
+            guild,
+            f"🔨 **Ban recorded (external)**\nUser: {user} (`{user.id}`)\n"
+            f"Moderator: {who}\nReason: {why}",
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await send_mod_log(
+            guild,
+            f"🔨 **Ban recorded**\nUser: {user} (`{user.id}`)\n"
+            "(Could not read audit log — missing View Audit Log permission.)",
+        )
+
+
+@bot.event
 async def on_member_unban(guild, user):
     # If a staff member manually removes the ban, immediately reapply it while the
     # blacklist entry is active. +unbl deletes that entry first, so it is exempt.
@@ -1358,7 +1394,7 @@ async def on_guild_role_update(before, after):
     if before.color != after.color:
         changes.append("Color changed")
     if changes:
-        await send_mod_log(after.guild, f"🎭 **Role updated**\nRole: {role.name} (`{role.id}`)\n" + "\n".join(changes))
+        await send_mod_log(after.guild, f"🎭 **Role updated**\nRole: {after.name} (`{after.id}`)\n" + "\n".join(changes))
 
 
 @bot.event
@@ -1389,11 +1425,20 @@ def contains_blocked_phrase(content, phrase):
     return re.search(pattern, content, flags=re.IGNORECASE) is not None
 
 
+def _prune_channel_map(store):
+    """Keep only the most recently touched channels when the map grows too large."""
+    if len(store) <= MAX_SNIPE_CHANNELS:
+        return
+    overflow = len(store) - MAX_SNIPE_CHANNELS
+    for key in list(store.keys())[:overflow]:
+        store.pop(key, None)
+
+
 def remember_deleted_message(message):
-    """Remember messages deleted by other users, moderators, or Discord systems for +snipe."""
+    """Remember deleted human messages for +snipe (keeps a short history per channel)."""
     if not message.guild or message.author.bot:
         return
-    sniped_messages[message.channel.id] = {
+    entry = {
         "content": message.content or "",
         "author_name": str(message.author),
         "author_id": message.author.id,
@@ -1402,7 +1447,175 @@ def remember_deleted_message(message):
         "deleted_at": discord.utils.utcnow(),
         "attachments": [attachment.url for attachment in message.attachments[:4]],
         "channel_id": message.channel.id,
+        "message_id": message.id,
     }
+    history = sniped_messages.setdefault(message.channel.id, [])
+    # Avoid duplicate ids if Discord fires delete more than once
+    history[:] = [e for e in history if e.get("message_id") != message.id]
+    history.append(entry)
+    if len(history) > MAX_SNIPE_HISTORY:
+        del history[:-MAX_SNIPE_HISTORY]
+    _prune_channel_map(sniped_messages)
+
+
+def remember_edited_message(before, after):
+    """Remember text edits for +editsnipe (keeps a short history per channel)."""
+    if not after.guild or after.author.bot:
+        return
+    before_content = (before.content or "").strip()
+    after_content = (after.content or "").strip()
+    if before_content == after_content:
+        return
+    entry = {
+        "before": before_content,
+        "after": after_content,
+        "author_name": str(after.author),
+        "author_id": after.author.id,
+        "avatar_url": after.author.display_avatar.url,
+        "edited_at": discord.utils.utcnow(),
+        "message_id": after.id,
+        "channel_id": after.channel.id,
+        "jump_url": after.jump_url,
+    }
+    history = edited_messages.setdefault(after.channel.id, [])
+    history.append(entry)
+    if len(history) > MAX_SNIPE_HISTORY:
+        del history[:-MAX_SNIPE_HISTORY]
+    _prune_channel_map(edited_messages)
+
+
+def build_snipe_embed(entry, index, total):
+    """Build one page of the snipe browser (index is 0-based, newest is total-1)."""
+    content = (entry.get("content") or "").strip() or (
+        "*No text content (the message may have contained an attachment or embed).*"
+    )
+    safe_content = discord.utils.escape_mentions(content)
+    if len(safe_content) > 3500:
+        safe_content = safe_content[:3497] + "..."
+    # Show newest as page 1 when listing from newest-first for the user
+    page = total - index  # newest = page 1
+    panel = discord.Embed(
+        title="GALAXY  /  SNIPE",
+        description=safe_content,
+        color=GALAXY_COLOR,
+        timestamp=entry.get("deleted_at") or discord.utils.utcnow(),
+    )
+    panel.set_author(
+        name=entry.get("author_name") or "Unknown",
+        icon_url=entry.get("avatar_url") or None,
+    )
+    panel.add_field(name="Channel", value=f"<#{entry.get('channel_id')}>", inline=True)
+    panel.add_field(name="Author ID", value=f"`{entry.get('author_id')}`", inline=True)
+    if entry.get("created_at"):
+        panel.add_field(
+            name="Originally sent",
+            value=discord.utils.format_dt(entry["created_at"], style="R"),
+            inline=True,
+        )
+    if entry.get("attachments"):
+        panel.add_field(
+            name="Attachments",
+            value="\n".join(entry["attachments"][:4]),
+            inline=False,
+        )
+    panel.set_footer(
+        text=f"GALAXY  ·  SNIPE  ·  {page}/{total}  ·  ◀ older  ·  newer ▶"
+    )
+    return panel
+
+
+def build_editsnipe_embed(entry, index, total):
+    before = entry.get("before") or "*empty*"
+    after = entry.get("after") or "*empty*"
+    safe_before = discord.utils.escape_mentions(before)
+    safe_after = discord.utils.escape_mentions(after)
+    if len(safe_before) > 900:
+        safe_before = safe_before[:897] + "..."
+    if len(safe_after) > 900:
+        safe_after = safe_after[:897] + "..."
+    page = total - index
+    panel = discord.Embed(
+        title="GALAXY  /  EDIT SNIPE",
+        color=GALAXY_COLOR,
+        timestamp=entry.get("edited_at") or discord.utils.utcnow(),
+    )
+    panel.set_author(
+        name=entry.get("author_name") or "Unknown",
+        icon_url=entry.get("avatar_url") or None,
+    )
+    panel.add_field(name="Before", value=safe_before, inline=False)
+    panel.add_field(name="After", value=safe_after, inline=False)
+    panel.add_field(name="Channel", value=f"<#{entry.get('channel_id')}>", inline=True)
+    panel.add_field(name="Author ID", value=f"`{entry.get('author_id')}`", inline=True)
+    if entry.get("jump_url"):
+        panel.add_field(name="Jump", value=f"[Open message]({entry['jump_url']})", inline=True)
+    panel.set_footer(
+        text=f"GALAXY  ·  EDIT SNIPE  ·  {page}/{total}  ·  ◀ older  ·  newer ▶"
+    )
+    return panel
+
+
+class SnipeBrowser(discord.ui.View):
+    """◀ / ▶ through deleted or edited message history in a channel."""
+
+    def __init__(self, entries, *, kind="snipe", author_id=None, timeout=120):
+        super().__init__(timeout=timeout)
+        # entries: oldest -> newest; start on newest
+        self.entries = list(entries)
+        self.index = len(self.entries) - 1
+        self.kind = kind
+        self.author_id = author_id
+        self.message = None
+        self._sync_buttons()
+
+    def _embed(self):
+        entry = self.entries[self.index]
+        total = len(self.entries)
+        if self.kind == "editsnipe":
+            return build_editsnipe_embed(entry, self.index, total)
+        return build_snipe_embed(entry, self.index, total)
+
+    def _sync_buttons(self):
+        # index 0 = oldest, last = newest
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.custom_id == "snipe_older":
+                child.disabled = self.index <= 0
+            elif child.custom_id == "snipe_newer":
+                child.disabled = self.index >= len(self.entries) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.author_id is None or interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who ran the command can flip through these pages.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary, custom_id="snipe_older")
+    async def older(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index > 0:
+            self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary, custom_id="snipe_newer")
+    async def newer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index < len(self.entries) - 1:
+            self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
 
 
 async def filter_bad_content(message):
@@ -1746,36 +1959,41 @@ async def on_message_delete(message):
     remember_deleted_message(message)
 
 
+@bot.event
+async def on_message_edit(before, after):
+    """Track the latest text edit per channel for +editsnipe."""
+    if after.author.bot or not after.guild:
+        return
+    remember_edited_message(before, after)
+
 
 @bot.command(name="snipe")
 @commands.guild_only()
 async def snipe(ctx):
-    """Show the most recently deleted message in this channel."""
-    deleted = sniped_messages.get(ctx.channel.id)
-    if not deleted:
+    """Browse recently deleted messages in this channel (◀ older / newer ▶)."""
+    history = sniped_messages.get(ctx.channel.id) or []
+    if not history:
         return await ctx.send("There isn’t a recently deleted message saved for this channel.")
 
-    content = deleted["content"].strip() or "*No text content (the message may have contained an attachment or embed).*"
-    # Keep the message readable without allowing mentions or markdown to ping/imitate staff.
-    safe_content = discord.utils.escape_mentions(content)
-    if len(safe_content) > 3500:
-        safe_content = safe_content[:3497] + "..."
-    panel = discord.Embed(
-        title="GALAXY  /  SNIPE",
-        description=safe_content,
-        color=GALAXY_COLOR,
-        timestamp=deleted["deleted_at"],
-    )
-    panel.set_author(name=deleted["author_name"], icon_url=deleted["avatar_url"])
-    panel.add_field(name="Channel", value=f"<#{deleted['channel_id']}>", inline=True)
-    panel.add_field(name="Author ID", value=f"`{deleted['author_id']}`", inline=True)
-    if deleted["created_at"]:
-        panel.add_field(name="Originally sent", value=discord.utils.format_dt(deleted["created_at"], style="R"), inline=True)
-    if deleted["attachments"]:
-        panel.add_field(name="Attachments", value="\n".join(deleted["attachments"]), inline=False)
-    panel.set_footer(text="GALAXY  ·  SNIPE  ·  LATEST DELETION IN THIS CHANNEL")
-    await ctx.send(embed=panel, allowed_mentions=discord.AllowedMentions.none())
+    view = SnipeBrowser(history, kind="snipe", author_id=ctx.author.id, timeout=120)
+    embed = view._embed()
+    # Single entry: still show buttons disabled appropriately via _sync_buttons
+    msg = await ctx.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+    view.message = msg
 
+
+@bot.command(name="editsnipe", aliases=["esnipe"])
+@commands.guild_only()
+async def editsnipe(ctx):
+    """Browse recently edited messages in this channel (◀ older / newer ▶)."""
+    history = edited_messages.get(ctx.channel.id) or []
+    if not history:
+        return await ctx.send("There isn’t a recently edited message saved for this channel.")
+
+    view = SnipeBrowser(history, kind="editsnipe", author_id=ctx.author.id, timeout=120)
+    embed = view._embed()
+    msg = await ctx.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+    view.message = msg
 
 
 def _get_last_riddle_at(guild_id):
@@ -2209,14 +2427,18 @@ async def galaxy_daily(ctx):
     if row and row[0]:
         from datetime import datetime, timezone
         try:
-            last = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
+            raw = str(row[0]).strip().replace(" ", "T", 1)
+            # SQLite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC)
+            last = datetime.fromisoformat(raw)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
             remaining = timedelta(hours=24) - (datetime.now(timezone.utc) - last)
             if remaining.total_seconds() > 0:
                 hours = int(remaining.total_seconds() // 3600)
                 minutes = int((remaining.total_seconds() % 3600) // 60)
                 return await ctx.send(f"You’ve already claimed today’s reward. Come back in **{hours}h {minutes}m**.")
-        except ValueError:
-            pass
+        except (ValueError, TypeError):
+            logger.exception("Could not parse last_daily for user %s: %r", ctx.author.id, row[0])
     reward = random.randint(200, 350)
     db.execute("INSERT INTO galaxy_coins(guild_id,user_id,balance,last_daily) VALUES(?,?,?,CURRENT_TIMESTAMP) "
                "ON CONFLICT(guild_id,user_id) DO UPDATE SET balance=balance+excluded.balance,last_daily=CURRENT_TIMESTAMP",
@@ -3414,6 +3636,42 @@ async def unban(ctx, user_id: int, *, reason="No reason provided"):
     await send_mod_log(ctx.guild, f"♻️ **Unban**\nUser: {user} (`{user.id}`)\nModerator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}")
 
 
+@bot.command(name="softban")
+@require_staff_rank(5)
+async def softban(ctx, member: FlexibleMember, *, reason="No reason provided"):
+    """Ban then immediately unban to purge recent messages (1 day of history). Perm 5+ only."""
+    if not can_moderate_target(ctx, member):
+        return await ctx.send("You can’t softban that member because of role hierarchy.")
+    reason = (reason or "No reason provided").strip()[:900] or "No reason provided"
+    target_id = member.id
+    target_label = str(member)
+    try:
+        await member.ban(reason=f"Softban by {ctx.author}: {reason}", delete_message_days=1)
+        await ctx.guild.unban(discord.Object(id=target_id), reason=f"Softban complete by {ctx.author}")
+    except discord.Forbidden:
+        return await ctx.send("I don’t have permission to ban/unban that member. Check Ban Members and role order.")
+    except discord.HTTPException:
+        logger.exception("Softban failed for %s", target_id)
+        return await ctx.send("Discord blocked the softban. They may already be banned, or something else went wrong.")
+    sanction_id = record_sanction(ctx.guild.id, target_id, ctx.author.id, "Softban", reason,
+                                  details="Ban + unban; 1 day of messages purged")
+    panel = build_mod_action_embed(
+        action_title="Member softbanned",
+        member_display=f"{target_label}\n`{target_id}`",
+        reason=reason,
+        moderator=f"{ctx.author.mention}\n`{ctx.author.id}`",
+        case_id=sanction_id,
+        extra_fields=[("Effect", "Kicked + recent messages purged (1 day)", False)],
+        color=WARN_COLOR,
+    )
+    await ctx.send(embed=panel)
+    await send_mod_log(
+        ctx.guild,
+        f"🧼 **Softban**\nUser: {target_label} (`{target_id}`)\n"
+        f"Moderator: {ctx.author} (`{ctx.author.id}`)\nReason: {reason}",
+    )
+
+
 @bot.command()
 @require_admin_actions()
 async def kick(ctx, member: FlexibleMember, *, reason="No reason provided"):
@@ -4099,7 +4357,7 @@ async def unwarn(ctx, warning_id: int):
     await send_mod_log(ctx.guild, f"🧹 **Warning removed**\nWarning: `#{warning_id}`\nUser ID: `{row[0]}`\nOriginal reason: {row[1]}\nBy: {ctx.author} (`{ctx.author.id}`)")
 
 
-@bot.command()
+@bot.command(aliases=["whois"])
 async def userinfo(ctx, target_input: str = None):
     if target_input is None:
         target = ctx.author
@@ -4223,6 +4481,192 @@ async def ping(ctx):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="botinfo", aliases=["uptime", "about"])
+async def botinfo(ctx):
+    """Bot status, uptime, and basic diagnostics."""
+    uptime_s = max(0, int(time.time() - BOT_STARTED_AT))
+    days, rem = divmod(uptime_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m")
+    parts.append(f"{secs}s")
+    uptime_label = " ".join(parts)
+    latency = round(bot.latency * 1000)
+    guilds = len(bot.guilds)
+    members = sum(g.member_count or 0 for g in bot.guilds)
+    coin_holders = 0
+    coin_total = 0
+    try:
+        row = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM galaxy_coins WHERE balance > 0"
+        ).fetchone()
+        coin_holders = int(row[0] or 0)
+        coin_total = int(row[1] or 0)
+    except Exception:
+        logger.exception("botinfo coin stats failed")
+    embed = discord.Embed(
+        title="GALAXY  /  BOT INFO",
+        description="Steal A Galacticrot community systems.",
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Uptime", value=f"**{uptime_label}**", inline=True)
+    embed.add_field(name="Latency", value=f"**{latency} ms**", inline=True)
+    embed.add_field(name="Servers", value=f"**{guilds}**", inline=True)
+    embed.add_field(name="Members (cached)", value=f"**{members:,}**", inline=True)
+    embed.add_field(name="Coin holders", value=f"**{coin_holders:,}**", inline=True)
+    embed.add_field(name="Coins in circulation", value=f"**{coin_total:,}**", inline=True)
+    embed.add_field(name="Prefix", value=f"`{PREFIX}`", inline=True)
+    embed.add_field(name="discord.py", value=f"`{getattr(discord, '__version__', '?')}`", inline=True)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.set_footer(text=f"GALAXY  ·  {bot.user}  ·  ID {bot.user.id}")
+    else:
+        embed.set_footer(text="GALAXY  ·  STATUS")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="poll")
+@commands.cooldown(1, 10, commands.BucketType.user)
+@commands.guild_only()
+async def poll(ctx, *, question_and_options: str = None):
+    """Create a quick reaction poll.
+    Usage: +poll Question? | Option A | Option B | Option C
+    Or: +poll Should we do this?  (defaults to Yes / No)
+    """
+    if not question_and_options or not question_and_options.strip():
+        return await ctx.send(
+            f"Usage: `{PREFIX}poll Question? | Option A | Option B`\n"
+            f"Or a simple yes/no: `{PREFIX}poll Should we host an event tonight?`"
+        )
+    parts = [p.strip() for p in question_and_options.split("|") if p.strip()]
+    if len(parts) == 1:
+        question = parts[0]
+        options = ["Yes", "No"]
+    else:
+        question = parts[0]
+        options = parts[1:10]  # Discord reaction limit practicality
+    if len(options) < 2:
+        return await ctx.send("Need at least **two** options (or a yes/no question with no `|`).")
+    if len(question) > 250:
+        return await ctx.send("Keep the question under **250** characters.")
+    # Number emoji 1️⃣..🔟
+    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = [f"**{discord.utils.escape_markdown(question)}**", ""]
+    for i, opt in enumerate(options):
+        lines.append(f"{number_emojis[i]}  {discord.utils.escape_markdown(opt[:100])}")
+    embed = discord.Embed(
+        title="GALAXY  /  POLL",
+        description="\n".join(lines),
+        color=GALAXY_ACCENT,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text=f"Poll by {ctx.author}  ·  react to vote")
+    msg = await ctx.send(embed=embed)
+    for i in range(len(options)):
+        try:
+            await msg.add_reaction(number_emojis[i])
+        except (discord.Forbidden, discord.HTTPException):
+            break
+
+
+@bot.command(name="remind", aliases=["remindme"])
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def remind(ctx, duration: str = None, *, text: str = None):
+    """Set a personal reminder. Example: +remind 30m check the event"""
+    if duration is None or not text:
+        return await ctx.send(
+            f"Usage: `{PREFIX}remind <time> <message>`\n"
+            f"Examples: `{PREFIX}remind 10m stretch` · `{PREFIX}remind 2h staff meeting`"
+        )
+    try:
+        seconds = parse_duration_seconds(duration)
+    except ValueError:
+        return await ctx.send(
+            f"Invalid time. Examples: `10m`, `1h`, `2h30m` is not supported — use `2h`.\n"
+            f"Try: `{PREFIX}remind 30m check applications`"
+        )
+    if seconds < 30:
+        return await ctx.send("Reminders need to be at least **30 seconds**.")
+    if seconds > 7 * 86400:
+        return await ctx.send("Reminders can’t be longer than **7 days**.")
+    label = format_duration_label(seconds)
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"Okay {ctx.author.mention} — I’ll remind you in **{label}**:\n> {discord.utils.escape_markdown(text[:500])}",
+            title="GALAXY  /  REMINDER SET",
+            color=SUCCESS_COLOR,
+            footer="GALAXY  ·  REMINDERS",
+        )
+    )
+
+    async def _fire():
+        try:
+            await asyncio.sleep(seconds)
+            panel = build_galaxy_embed(
+                f"⏰ {ctx.author.mention} reminder:\n> {discord.utils.escape_markdown(text[:900])}",
+                title="GALAXY  /  REMINDER",
+                color=GALAXY_ACCENT,
+                footer="GALAXY  ·  REMINDERS",
+            )
+            try:
+                await ctx.author.send(embed=panel)
+            except (discord.Forbidden, discord.HTTPException):
+                try:
+                    await ctx.channel.send(
+                        content=ctx.author.mention,
+                        embed=panel,
+                        allowed_mentions=discord.AllowedMentions(users=[ctx.author]),
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.warning("Could not deliver reminder to %s", ctx.author.id)
+        except asyncio.CancelledError:
+            return
+
+    task = asyncio.create_task(_fire())
+    active_reminders.setdefault(ctx.author.id, []).append(task)
+
+
+@bot.command(name="endriddle", aliases=["skipriddle", "closeriddle"])
+@commands.guild_only()
+@require_staff_rank(5)
+async def endriddle(ctx):
+    """End the active riddle early and reveal the answer (Perm 5+)."""
+    active = active_galaxy_questions.pop(ctx.guild.id, None)
+    if not active:
+        return await ctx.send("There’s no active riddle to end.")
+    answer = active.get("answer", "???")
+    channel_id = active.get("channel_id")
+    await ctx.send(
+        embed=build_galaxy_embed(
+            f"Riddle closed by {ctx.author.mention}.\nThe answer was **{discord.utils.escape_markdown(str(answer))}**.",
+            title="GALAXY  /  RIDDLE ENDED",
+            color=WARN_COLOR,
+            footer="GALAXY  ·  COMMUNITY GAME",
+        )
+    )
+    if channel_id and channel_id != ctx.channel.id:
+        channel = ctx.guild.get_channel(channel_id)
+        if channel is not None:
+            try:
+                await send_panel(
+                    channel,
+                    f"⌛ Round closed by staff. The answer was **{answer}**.",
+                    title="GALAXY  /  RIDDLE",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+    await send_mod_log(
+        ctx.guild,
+        f"⌛ **Riddle ended early**\nBy: {ctx.author} (`{ctx.author.id}`)\nAnswer: {answer}",
+    )
+
+
 @bot.command()
 async def help(ctx):
     """Compact command directory, displayed as one Galaxy panel."""
@@ -4230,7 +4674,7 @@ async def help(ctx):
         title="GALAXY  /  COMMAND GUIDE",
         description=(
             f"Commands use the `{PREFIX}` prefix. Reply to a member’s message to use them as the target "
-            f"for supported moderation commands. `{PREFIX}snipe` shows the latest deleted message in this channel."
+            f"for supported moderation commands. `{PREFIX}snipe` browses deleted messages with ◀ ▶ arrows; `{PREFIX}editsnipe` does the same for edits."
         ),
         color=GALAXY_COLOR,
         timestamp=discord.utils.utcnow(),
@@ -4238,9 +4682,10 @@ async def help(ctx):
     embed.add_field(
         name="START HERE",
         value=(
-            f"`{PREFIX}help`  `{PREFIX}ping`  `{PREFIX}perms`\n"
-            f"`{PREFIX}userinfo [member]`  `{PREFIX}avatar [member]`\n"
-            f"`{PREFIX}mc`  `{PREFIX}serverinfo`  `{PREFIX}roleinfo`  `{PREFIX}snipe`"
+            f"`{PREFIX}help`  `{PREFIX}ping`  `{PREFIX}perms`  `{PREFIX}botinfo`\n"
+            f"`{PREFIX}userinfo` / `{PREFIX}whois`  `{PREFIX}avatar`  `{PREFIX}mc`\n"
+            f"`{PREFIX}serverinfo`  `{PREFIX}roleinfo`  `{PREFIX}snipe`  `{PREFIX}editsnipe`\n"
+            f"`{PREFIX}poll`  `{PREFIX}remind <time> <text>`"
         ),
         inline=False,
     )
@@ -4252,7 +4697,7 @@ async def help(ctx):
             f"`{PREFIX}tempmute` / `{PREFIX}timeout <member> <10m/1h/7d>`  `{PREFIX}unmute`\n"
             f"`{PREFIX}vcmute` / `{PREFIX}vcdeafen` [time] (Perm 4+)  `{PREFIX}vcunmute`  `{PREFIX}vcundeafen`\n"
             f"`{PREFIX}clear <amount>` / reply `{PREFIX}clear <amount>`  `{PREFIX}kick` (Perm 3+)\n"
-            f"`{PREFIX}ban` (Perm 4+)  `{PREFIX}unban`"
+            f"`{PREFIX}ban` (Perm 4+)  `{PREFIX}softban` (Perm 5+)  `{PREFIX}unban`"
         ),
         inline=False,
     )
@@ -4280,10 +4725,11 @@ async def help(ctx):
         name="GALAXY COINS",
         value=(
             f"`{PREFIX}balance` / `{PREFIX}bal`  `{PREFIX}daily`  `{PREFIX}tradecoins` / `{PREFIX}givecoins`\n"
-            f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}slots`  `{PREFIX}dice`  `{PREFIX}riddle`  `{PREFIX}leaderboard`\n"
+            f"`{PREFIX}cf <amount> [heads/tails]`  `{PREFIX}slots`  `{PREFIX}dice`\n"
+            f"`{PREFIX}riddle`  `{PREFIX}endriddle` (staff)  `{PREFIX}leaderboard`\n"
             f"`{PREFIX}addcoins`  `{PREFIX}removecoins` / `{PREFIX}takecoins`  `{PREFIX}setcoins` (Assistant Staff Manager+)\n"
             "Anyone can trade their own coins. You can bet everything with `all` and pick heads or tails "
-            "(your side lands ~40% of the time). Riddles post every 1h 30m — reply to the riddle message "
+            "(fair 50/50 coin). Riddles post every 1h 30m — reply to the riddle message "
             f"or use `{PREFIX}riddle <answer>`. Wrong answers give up to 3 hints. Leaderboard every 3 hours."
         ),
         inline=False,
