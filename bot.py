@@ -2916,7 +2916,15 @@ async def on_message(message):
         # Codes count in ANY channel of the server, not just the one they were dropped in.
         typed = message.content.strip().upper()
         if typed == active_code["code"]:
-            active_codes.pop(key, None)  # pop before any await: first person wins
+            # A member can claim this particular code only once, even when its
+            # stock allows multiple winners. Reserve the claim before awaiting payout.
+            claimed_by = active_code.setdefault("claimed_by", set())
+            if message.author.id in claimed_by:
+                return
+            claimed_by.add(message.author.id)
+            active_code["remaining"] = active_code.get("remaining", 1) - 1
+            if active_code["remaining"] <= 0:
+                active_codes.pop(key, None)
             await _award_code_claim(message, active_code)
             return
         if _strip_invisible(typed) == active_code["code"]:
@@ -6119,8 +6127,11 @@ async def _award_code_claim(message, active):
         new_bal = get_coin_balance(guild_id, message.author.id)
     except Exception:
         logger.exception("Code payout failed for user %s", message.author.id)
-        active_codes[(guild_id, active.get("slot", "manual"))] = active  # put it back so the code isn't wasted
-        return
+        # Restore this claim if the payout failed, so stock is never consumed unfairly.
+        active["remaining"] = active.get("remaining", 1) + 1
+        active.setdefault("claimed_by", set()).discard(message.author.id)
+        active_codes[(guild_id, active.get("slot", "manual"))] = active
+        return False
     panel = build_galaxy_embed(
         f"› {message.author.mention} typed the code first and won "
         f"**{active['amount']:,} Galaxy Coins**!\n"
@@ -6134,15 +6145,29 @@ async def _award_code_claim(message, active):
         )
     except (discord.Forbidden, discord.HTTPException):
         logger.exception("Failed to announce code winner in %s", message.channel.id)
-    # Mark the original drop as claimed.
+    # Update the drop panel after each successful claim; close it when stock is empty.
     if active.get("message_id"):
         try:
-            closed = build_galaxy_embed(
-                f"This code was claimed by {message.author.mention}.",
-                title="GALAXY  /  CODE DROP (CLAIMED)", color=GALAXY_COLOR, footer="GALAXY  ·  CODE DROP",
-            )
             drop_channel = message.guild.get_channel(active["channel_id"]) or message.channel
-            await drop_channel.get_partial_message(active["message_id"]).edit(embed=closed)
+            drop_message = await drop_channel.fetch_message(active["message_id"])
+            if active.get("remaining", 0) <= 0:
+                updated = build_galaxy_embed(
+                    f"This code is out of stock. Last claim: {message.author.mention}.",
+                    title="GALAXY  /  CODE DROP (SOLD OUT)", color=GALAXY_COLOR, footer="GALAXY  ·  CODE DROP",
+                )
+            else:
+                updated = drop_message.embeds[0].copy() if drop_message.embeds else build_galaxy_embed(
+                    "Code still available.", title="GALAXY  /  CODE DROP", color=GALAXY_COLOR,
+                    footer="GALAXY  ·  CODE DROP",
+                )
+                updated.description = (
+                    f"First **{active['remaining']}** people to type this code in chat can still win "
+                    f"**{active['amount']:,} Galaxy Coins** each.\n\n"
+                    f"# `{_anti_paste_code(active['code'])}`\n\n"
+                    f"You have to **type it out** — copy and paste won't work.\n"
+                    f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**."
+                )
+            await drop_message.edit(embed=updated)
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             pass
     await send_mod_log(
@@ -6150,6 +6175,7 @@ async def _award_code_claim(message, active):
         f"🎟️ **Code claimed**\nWinner: {message.author} (`{message.author.id}`)"
         f"\nAmount: {active['amount']:,}\nStarted by: <@{active['starter_id']}>",
     )
+    return True
 
 
 # Invisible characters hidden inside the displayed code. They are copied along with
@@ -6172,20 +6198,29 @@ AUTO_CODE_CHANNEL_ID = 1575961199047348366   # channel where the bot drops codes
 AUTO_CODE_MIN = 1                            # smallest automatic reward (coins)
 AUTO_CODE_MAX = 50_000_000_000               # biggest automatic reward: 50b coins
 AUTO_CODE_INTERVAL_SECONDS = 30 * 60         # an automatic drop every 30 minutes, whether or not staff used +code
+AUTO_CODE_STOCK = 3                           # stock when an automatic drop gets the bonus stock
+AUTO_CODE_STOCK_CHANCE = 0.10                 # 10% chance an automatic code gets 3 claims; otherwise it gets 1
+MAX_CODE_STOCK = 10_000                       # prevents accidental huge stock values
 last_auto_code_at = {}                       # guild_id -> time of the latest AUTOMATIC drop
 
 
-async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual"):
-    """Post a code drop in `channel` and start tracking it. Used by +code and the auto drops."""
-    guild = channel.guild
-    code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
-    panel = build_galaxy_embed(
-        f"First person to type this code in chat (any channel) wins **{reward:,} Galaxy Coins**!\n\n"
+def _code_drop_embed(reward, code, remaining):
+    """Build the code panel with the current number of claims remaining."""
+    return build_galaxy_embed(
+        f"First **{remaining}** people to type this code in chat (any channel) each win "
+        f"**{reward:,} Galaxy Coins**!\n\n"
         f"# `{_anti_paste_code(code)}`\n\n"
         f"You have to **type it out** — copy and paste won't work.\n"
         f"Expires in **{CODE_EXPIRE_SECONDS // 60} minutes**.",
         title="GALAXY  /  CODE DROP", color=GALAXY_ACCENT, footer="GALAXY  ·  CODE DROP",
     )
+
+
+async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual", stock=1):
+    """Post a code drop with a limited number of claims."""
+    guild = channel.guild
+    code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
+    panel = _code_drop_embed(reward, code, stock)
     # +code always pings the role; automatic drops only ping some of the time.
     if always_ping or random.random() < CODE_PING_CHANCE:
         sent = await channel.send(
@@ -6200,10 +6235,12 @@ async def _send_code_drop(channel, reward, starter_id, starter_label, always_pin
     active_codes[(guild.id, slot)] = {
         "code": code, "amount": reward, "channel_id": channel.id, "slot": slot,
         "message_id": sent.id, "starter_id": starter_id, "expires_at": now + CODE_EXPIRE_SECONDS,
+        "remaining": stock, "stock": stock, "claimed_by": set(),
     }
     await send_mod_log(
         guild,
-        f"🎟️ **Code dropped**\nBy: {starter_label}\nChannel: {channel.mention}\nReward: {reward:,}",
+        f"🎟️ **Code dropped**\nBy: {starter_label}\nChannel: {channel.mention}"
+        f"\nReward per claim: {reward:,}\nStock: {stock}",
     )
     return sent
 
@@ -6227,7 +6264,14 @@ async def auto_code_scheduler():
                     continue
                 last_auto_code_at[guild.id] = now  # reset first so a failure can't loop-spam
                 reward = random.randint(AUTO_CODE_MIN, AUTO_CODE_MAX)
-                await _send_code_drop(channel, reward, bot.user.id, "automatic drop (bot)", slot="auto")
+                # Automatic drops normally have 1 claim. Only 10% (configurable)
+                # receive bonus stock (3 claims by default). Each member can claim
+                # a particular code only once.
+                auto_stock = AUTO_CODE_STOCK if random.random() < AUTO_CODE_STOCK_CHANCE else 1
+                await _send_code_drop(
+                    channel, reward, bot.user.id, "automatic drop (bot)",
+                    slot="auto", stock=auto_stock,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6237,8 +6281,8 @@ async def auto_code_scheduler():
 @bot.command(name="code", aliases=["dropcode", "coincode"])
 @commands.guild_only()
 @require_director_plus()
-async def code_cmd(ctx, amount: str = None):
-    """Drop a code in this channel. First person to type it wins coins. +code [amount]"""
+async def code_cmd(ctx, amount: str = None, stock: str = "1"):
+    """Drop a code with limited claims. Usage: +code [reward] [stock]"""
     current = active_codes.get((ctx.guild.id, "manual"))
     if current and time.time() < current["expires_at"]:
         return await ctx.send(
@@ -6251,12 +6295,23 @@ async def code_cmd(ctx, amount: str = None):
         try:
             reward = parse_coin_amount(amount)
         except ValueError:
-            return await ctx.send(f"Enter a valid amount, e.g. `{PREFIX}code 500` or just `{PREFIX}code`.")
+            return await ctx.send(
+                f"Usage: `{PREFIX}code [reward] [stock]` — example: `{PREFIX}code 500 10`."
+            )
         if not 1 <= reward <= MAX_CODE_REWARD:
             return await ctx.send(f"The reward must be between **1** and **{MAX_CODE_REWARD:,}** coins.")
 
+    try:
+        claim_stock = int(stock)
+    except (TypeError, ValueError):
+        return await ctx.send("Stock must be a whole number.")
+    if not 1 <= claim_stock <= MAX_CODE_STOCK:
+        return await ctx.send(f"Stock must be between **1** and **{MAX_CODE_STOCK:,}** claims.")
+
     await _send_code_drop(
-        ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)", always_ping=True)
+        ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)",
+        always_ping=True, stock=claim_stock,
+    )
 
 
 # ----------------------------- 1v1 POKER -----------------------------------
