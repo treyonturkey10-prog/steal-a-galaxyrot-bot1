@@ -6458,7 +6458,7 @@ def require_director_plus():
 CODE_EXPIRE_SECONDS = 10 * 60      # an unclaimed code expires after 10 minutes
 CODE_PING_ROLE_ID = 1571339142816858132  # role that can get pinged when a code drops
 CODE_PING_CHANCE = 0.45  # chance (0.0-1.0) that an AUTOMATIC drop pings the role (+code always pings)
-MAX_CODE_REWARD = 1_000_000        # safety cap so a typo can't print a fortune
+MAX_CODE_REWARD = MAX_SQLITE_INT  # manual code rewards may use any positive SQLite-safe coin amount
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I confusion
 active_codes = {}                  # (guild_id, "manual"|"auto") -> {"code", "amount", "channel_id", ...}
 
@@ -6540,11 +6540,11 @@ def _strip_invisible(text):
 
 AUTO_CODE_CHANNEL_ID = 1575961199047348366   # channel where the bot drops codes by itself
 AUTO_CODE_MIN = 1                            # smallest automatic reward (coins)
-AUTO_CODE_MAX = 50_000_000_000               # biggest automatic reward: 50b coins
+AUTO_CODE_MAX = 50_000_000                   # biggest automatic reward: 50 million coins
 AUTO_CODE_INTERVAL_SECONDS = 30 * 60         # an automatic drop every 30 minutes, whether or not staff used +code
 AUTO_CODE_STOCK = 3                           # stock when an automatic drop gets the bonus stock
 AUTO_CODE_STOCK_CHANCE = 0.10                 # 10% chance an automatic code gets 3 claims; otherwise it gets 1
-MAX_CODE_STOCK = 10_000                       # prevents accidental huge stock values
+MAX_CODE_STOCK = MAX_SQLITE_INT               # manual stock can be any positive whole-number amount
 last_auto_code_at = {}                       # guild_id -> time of the latest AUTOMATIC drop
 
 
@@ -6560,10 +6560,10 @@ def _code_drop_embed(reward, code, remaining):
     )
 
 
-async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual", stock=1):
+async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual", stock=1, custom_code=None):
     """Post a code drop with a limited number of claims."""
     guild = channel.guild
-    code = "".join(random.choice(CODE_ALPHABET) for _ in range(8))
+    code = custom_code.upper() if custom_code else "".join(random.choice(CODE_ALPHABET) for _ in range(8))
     panel = _code_drop_embed(reward, code, stock)
     # +code always pings the role; automatic drops only ping some of the time.
     if always_ping or random.random() < CODE_PING_CHANCE:
@@ -6643,7 +6643,7 @@ async def code_cmd(ctx, amount: str = None, stock: str = "1"):
                 f"Usage: `{PREFIX}code [reward] [stock]` — example: `{PREFIX}code 500 10`."
             )
         if not 1 <= reward <= MAX_CODE_REWARD:
-            return await ctx.send(f"The reward must be between **1** and **{MAX_CODE_REWARD:,}** coins.")
+            return await ctx.send(f"The reward must be a positive whole-number amount (up to **{MAX_CODE_REWARD:,}** coins).")
 
     try:
         claim_stock = int(stock)
@@ -6655,6 +6655,74 @@ async def code_cmd(ctx, amount: str = None, stock: str = "1"):
     await _send_code_drop(
         ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)",
         always_ping=True, stock=claim_stock,
+    )
+
+
+# Custom-code access is based ONLY on these staff roles. Discord Administrator
+# permission does not grant access, and lower admin/moderator roles are excluded.
+CUSTOM_CODE_ROLE_IDS = {
+    ROLE_IDS["server_manager"], ROLE_IDS["manager"],
+    ROLE_IDS["assistant_head_manager"], ROLE_IDS["head_manager"],
+    ROLE_IDS["trial_director"], ROLE_IDS["head_director"],
+    ROLE_IDS["senior_drc"], ROLE_IDS["drc"], ROLE_IDS["axelle"], ROLE_IDS["dev"],
+    ROLE_IDS["main_founder"], ROLE_IDS["founder"], ROLE_IDS["co_owner"],
+}
+
+
+def require_server_manager_plus():
+    async def predicate(ctx):
+        return ctx.guild is not None and bool(member_role_ids(ctx.author) & CUSTOM_CODE_ROLE_IDS)
+    return commands.check(predicate)
+
+
+@bot.command(name="customcode", aliases=["makecode", "ccode"])
+@commands.guild_only()
+@require_server_manager_plus()
+async def custom_code_cmd(ctx, amount: str = None, stock: str = "1", *, custom_code: str = None):
+    """Create a code with a name chosen by staff. Usage: +customcode <reward> <stock> <code>"""
+    current = active_codes.get((ctx.guild.id, "manual"))
+    if current and time.time() < current["expires_at"]:
+        return await ctx.send(
+            f"There's already an active code in <#{current['channel_id']}>. "
+            "Wait for it to be claimed or to expire."
+        )
+
+    if amount is None or custom_code is None:
+        return await ctx.send(
+            f"Usage: `{PREFIX}customcode <reward> <stock> <code>` — "
+            f"example: `{PREFIX}customcode 500 10 LEO500`."
+        )
+
+    try:
+        reward = parse_coin_amount(amount)
+    except ValueError:
+        return await ctx.send("Reward must be a valid whole-number coin amount.")
+    if not 1 <= reward <= MAX_CODE_REWARD:
+        return await ctx.send(f"The reward must be a positive whole-number amount (up to **{MAX_CODE_REWARD:,}** coins).")
+
+    try:
+        claim_stock = int(stock)
+    except (TypeError, ValueError):
+        return await ctx.send("Stock must be a whole number.")
+    if not 1 <= claim_stock <= MAX_CODE_STOCK:
+        return await ctx.send(f"Stock must be between **1** and **{MAX_CODE_STOCK:,}** claims.")
+
+    chosen_code = custom_code.strip().upper()
+    if not 3 <= len(chosen_code) <= 24 or not all(ch.isalnum() or ch in "_-" for ch in chosen_code):
+        return await ctx.send("Your code must be 3–24 characters and use only letters, numbers, `_` or `-`.")
+
+    now = time.time()
+    for (guild_id, _slot), active in list(active_codes.items()):
+        if guild_id != ctx.guild.id:
+            continue
+        if now >= active.get("expires_at", 0):
+            active_codes.pop((guild_id, _slot), None)
+        elif active.get("code", "").upper() == chosen_code:
+            return await ctx.send("That code is already active. Choose a different code.")
+
+    await _send_code_drop(
+        ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)",
+        always_ping=True, stock=claim_stock, custom_code=chosen_code,
     )
 
 
