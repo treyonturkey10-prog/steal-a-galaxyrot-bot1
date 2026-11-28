@@ -6569,13 +6569,15 @@ def _code_drop_embed(reward, code, remaining):
     )
 
 
-async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual", stock=1, custom_code=None):
+async def _send_code_drop(channel, reward, starter_id, starter_label, always_ping=False, slot="manual", stock=1, custom_code=None, ping_override=None):
     """Post a code drop with a limited number of claims."""
     guild = channel.guild
     code = custom_code.upper() if custom_code else "".join(random.choice(CODE_ALPHABET) for _ in range(8))
     panel = _code_drop_embed(reward, code, stock)
-    # +code always pings the role; automatic drops only ping some of the time.
-    if always_ping or random.random() < CODE_PING_CHANCE:
+    # ping_override lets slash commands explicitly choose ping/no-ping.
+    # Otherwise +code can force a ping and automatic drops use the configured chance.
+    should_ping = ping_override if ping_override is not None else (always_ping or random.random() < CODE_PING_CHANCE)
+    if should_ping:
         sent = await channel.send(
             content=f"<@&{CODE_PING_ROLE_ID}>",
             embed=panel,
@@ -6685,8 +6687,9 @@ async def custom_code_slash(
     reward: str,
     stock: int,
     code: str,
+    ping: bool = True,
 ):
-    """Create a custom named code. Example: /customcode reward:500 stock:10 code:LEO500"""
+    """Create a custom named code. Set ping to false to post without pinging the role."""
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message(
             "This command can only be used inside the server.", ephemeral=True
@@ -6745,10 +6748,11 @@ async def custom_code_slash(
     await _send_code_drop(
         interaction.channel, reward_amount, interaction.user.id,
         f"{interaction.user} (`{interaction.user.id}`)",
-        always_ping=True, stock=stock, custom_code=chosen_code,
+        always_ping=False, stock=stock, custom_code=chosen_code, ping_override=ping,
     )
+    ping_status = "and pinged the code role" if ping else "without pinging the code role"
     await interaction.followup.send(
-        f"Created code **{chosen_code}** with **{reward_amount:,}** coins and **{stock:,}** claim(s).",
+        f"Created code **{chosen_code}** with **{reward_amount:,}** coins and **{stock:,}** claim(s), {ping_status}.",
         ephemeral=True,
     )
 
