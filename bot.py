@@ -1753,6 +1753,15 @@ async def on_ready():
         logger.exception("Could not set bot presence")
     logger.info("Logged in as %s (ID %s) | Prefix: %s | Guilds: %s",
                 bot.user, getattr(bot.user, "id", "unknown"), PREFIX, len(bot.guilds))
+    # Register slash commands with Discord. Global commands may take a little
+    # while to appear for every server after the first successful sync.
+    if not getattr(bot, "_slash_commands_synced", False):
+        try:
+            synced_commands = await bot.tree.sync()
+            bot._slash_commands_synced = True
+            logger.info("Synced %s application (slash) commands.", len(synced_commands))
+        except Exception:
+            logger.exception("Could not sync application (slash) commands")
     if not intents.message_content:
         logger.error("Message Content Intent is disabled in code; prefix commands cannot work.")
     logger.info("Prefix commands require Message Content Intent enabled in the Discord Developer Portal.")
@@ -6658,7 +6667,7 @@ async def code_cmd(ctx, amount: str = None, stock: str = "1"):
     )
 
 
-# Custom-code access is based ONLY on these staff roles. Discord Administrator
+# /customcode access is based ONLY on these staff roles. Discord Administrator
 # permission does not grant access, and lower admin/moderator roles are excluded.
 CUSTOM_CODE_ROLE_IDS = {
     ROLE_IDS["server_manager"], ROLE_IDS["manager"],
@@ -6669,60 +6678,78 @@ CUSTOM_CODE_ROLE_IDS = {
 }
 
 
-def require_server_manager_plus():
-    async def predicate(ctx):
-        return ctx.guild is not None and bool(member_role_ids(ctx.author) & CUSTOM_CODE_ROLE_IDS)
-    return commands.check(predicate)
+@bot.tree.command(name="customcode", description="Create a Galaxy Coins code with your own name, reward, and stock.")
+@discord.app_commands.guild_only()
+async def custom_code_slash(
+    interaction: discord.Interaction,
+    reward: str,
+    stock: int,
+    code: str,
+):
+    """Create a custom named code. Example: /customcode reward:500 stock:10 code:LEO500"""
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message(
+            "This command can only be used inside the server.", ephemeral=True
+        )
 
+    # Role IDs only: Administrator permission by itself never grants access.
+    if not (member_role_ids(interaction.user) & CUSTOM_CODE_ROLE_IDS):
+        return await interaction.response.send_message(
+            "You need the Server Manager role or a higher approved staff role to use this command.",
+            ephemeral=True,
+        )
 
-@bot.command(name="customcode", aliases=["makecode", "ccode"])
-@commands.guild_only()
-@require_server_manager_plus()
-async def custom_code_cmd(ctx, amount: str = None, stock: str = "1", *, custom_code: str = None):
-    """Create a code with a name chosen by staff. Usage: +customcode <reward> <stock> <code>"""
-    current = active_codes.get((ctx.guild.id, "manual"))
+    current = active_codes.get((interaction.guild.id, "manual"))
     if current and time.time() < current["expires_at"]:
-        return await ctx.send(
-            f"There's already an active code in <#{current['channel_id']}>. "
-            "Wait for it to be claimed or to expire."
-        )
-
-    if amount is None or custom_code is None:
-        return await ctx.send(
-            f"Usage: `{PREFIX}customcode <reward> <stock> <code>` — "
-            f"example: `{PREFIX}customcode 500 10 LEO500`."
+        return await interaction.response.send_message(
+            f"There's already an active code in <#{current['channel_id']}>. Wait for it to be claimed or to expire.",
+            ephemeral=True,
         )
 
     try:
-        reward = parse_coin_amount(amount)
+        reward_amount = parse_coin_amount(reward)
     except ValueError:
-        return await ctx.send("Reward must be a valid whole-number coin amount.")
-    if not 1 <= reward <= MAX_CODE_REWARD:
-        return await ctx.send(f"The reward must be a positive whole-number amount (up to **{MAX_CODE_REWARD:,}** coins).")
+        return await interaction.response.send_message(
+            "Reward must be a valid whole-number coin amount.", ephemeral=True
+        )
+    if not 1 <= reward_amount <= MAX_CODE_REWARD:
+        return await interaction.response.send_message(
+            f"The reward must be a positive whole-number amount (up to **{MAX_CODE_REWARD:,}** coins).",
+            ephemeral=True,
+        )
 
-    try:
-        claim_stock = int(stock)
-    except (TypeError, ValueError):
-        return await ctx.send("Stock must be a whole number.")
-    if not 1 <= claim_stock <= MAX_CODE_STOCK:
-        return await ctx.send(f"Stock must be between **1** and **{MAX_CODE_STOCK:,}** claims.")
+    if not 1 <= stock <= MAX_CODE_STOCK:
+        return await interaction.response.send_message(
+            f"Stock must be between **1** and **{MAX_CODE_STOCK:,}** claims.", ephemeral=True
+        )
 
-    chosen_code = custom_code.strip().upper()
+    chosen_code = code.strip().upper()
     if not 3 <= len(chosen_code) <= 24 or not all(ch.isalnum() or ch in "_-" for ch in chosen_code):
-        return await ctx.send("Your code must be 3–24 characters and use only letters, numbers, `_` or `-`.")
+        return await interaction.response.send_message(
+            "Your code must be 3–24 characters and use only letters, numbers, `_` or `-`.",
+            ephemeral=True,
+        )
 
     now = time.time()
-    for (guild_id, _slot), active in list(active_codes.items()):
-        if guild_id != ctx.guild.id:
+    for (guild_id, slot_name), active in list(active_codes.items()):
+        if guild_id != interaction.guild.id:
             continue
         if now >= active.get("expires_at", 0):
-            active_codes.pop((guild_id, _slot), None)
+            active_codes.pop((guild_id, slot_name), None)
         elif active.get("code", "").upper() == chosen_code:
-            return await ctx.send("That code is already active. Choose a different code.")
+            return await interaction.response.send_message(
+                "That code is already active. Choose a different code.", ephemeral=True
+            )
 
+    await interaction.response.defer(ephemeral=True)
     await _send_code_drop(
-        ctx.channel, reward, ctx.author.id, f"{ctx.author} (`{ctx.author.id}`)",
-        always_ping=True, stock=claim_stock, custom_code=chosen_code,
+        interaction.channel, reward_amount, interaction.user.id,
+        f"{interaction.user} (`{interaction.user.id}`)",
+        always_ping=True, stock=stock, custom_code=chosen_code,
+    )
+    await interaction.followup.send(
+        f"Created code **{chosen_code}** with **{reward_amount:,}** coins and **{stock:,}** claim(s).",
+        ephemeral=True,
     )
 
 
